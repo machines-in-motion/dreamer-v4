@@ -5,6 +5,32 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Tuple, Optional
 
+# Todo: verify the implementation of SwiGLU numically matches the paper
+class SwiGLU(nn.Module):
+    """
+    SwiGLU activation block from:
+    'GLU Variants Improve Transformer', Shazeer 2020.
+    
+    Computes: Swish(xW1) * (xW2)
+    """
+    def __init__(self, dim_in, dim_hidden):
+        super().__init__()
+        # Two linear projections: W and V in the paper
+        self.W = nn.Linear(dim_in, dim_hidden, bias=True)
+        self.V = nn.Linear(dim_in, dim_hidden, bias=True)
+
+    def forward(self, x):
+        """
+        x: (B, T, D)
+        """
+        xW = self.W(x)                  # gate input
+        xV = self.V(x)                  # value input
+
+        # Swish(xW) = xW * sigmoid(xW)
+        swish_gate = xW * torch.sigmoid(xW)
+
+        return swish_gate * xV          # elementwise product
+
 class RopeEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048, device = 'cpu'):
         super().__init__()
@@ -33,8 +59,10 @@ class RopeEmbedding(nn.Module):
         k_rot = (k * cos_emb) + (kJ * sin_emb)
         return q_rot, k_rot
     
-
 class Attention(nn.Module):
+    """
+    Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
+    """
     def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
@@ -98,36 +126,182 @@ class Attention(nn.Module):
         Y = Y.transpose(1, 2).contiguous().view(B, T_q, self.d)
         Y = self.W_o(Y)
         return Y
+
+class AxialAttention(nn.Module):
+    """
+    Axial wrapper around your Attention block.
+    Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
+    """
+    def __init__(
+        self,
+        inner_attn: nn.Module,                      # your Attention(...)
+    ):
+        super().__init__()
+        self.attn = inner_attn  # expects (B*, T, D) → (B*, T, D)
+
+    def forward(self,
+                q: torch.Tensor, 
+                k: torch.Tensor, 
+                v:torch.Tensor, 
+                dim: int, 
+                mask: Optional[torch.Tensor] = None):
+        
+        dims_q = list(q.shape)
+        assert dim > 0 and dim < q.dim(), "Dimension for attention must be between 1 and q.dim()-1"
+        D = dims_q[-1]
+        Tq_k = dims_q[dim]
+        dims_kv = list(k.shape)
+        Tk_k = dims_kv[dim]
+        reordered_q = q.transpose(dim, -2).contiguous().view(-1, Tq_k, D)
+        reordered_k = k.transpose(dim, -2).contiguous().view(-1, Tk_k, D)
+        reordered_v = v.transpose(dim, -2).contiguous().view(-1, Tk_k, D)
+        if mask is not None:
+            assert mask.shape[-2] == q.shape[dim] and mask.shape[-1] == k.shape[dim], "Mask shape does not match the attention dimensions."
+            if mask.dim() ==2:
+                mask = mask.unsqueeze(0)  # 1xTq xTk
+        Y = self.attn(reordered_q, reordered_k, reordered_v, mask)
+        Y = Y.view((dims_q[:dim]+dims_q[dim+1:-1]+[dims_q[dim], D])).transpose(dim, -2).contiguous()
+        return Y
     
+class AxialSelfAttentionBlock(nn.Module):
+    """
+    Axial Self-Attention block with residual connection and RMSNorm.
+    Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
+    """
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+        super().__init__()  
+        self.model_dim = model_dim  
+        self.n_heads = n_heads  
+        self.n_kv_heads = n_kv_heads
+        self.causal = causal    
+        self.dropout_prob = dropout_prob
+        self.qk_norm = qk_norm
+        self.max_seq_len = max_seq_len
+        self.rope_embedder = rope_embedder
+        
+        self.attnk = AxialAttention(
+            inner_attn=Attention(
+                model_dim=model_dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                causal=causal,
+                dropout_prob=dropout_prob,
+                qk_norm=qk_norm,
+                max_seq_len=max_seq_len,
+                rope_embedder=rope_embedder
+            )
+        )
+        self.Dense = nn.Linear(model_dim, model_dim)
+        self.rmsnorm = nn.RMSNorm(model_dim)
+    def forward(self,
+                x: torch.Tensor, 
+                dim: int, 
+                mask: Optional[torch.Tensor] = None):
+        """
+        x: (B, dim1, ..., dimN, D)
+        dim: int, the dimension along which attention is applied
+        mask: Optional[torch.Tensor], attention mask
+        """
+        x_norm = self.rmsnorm(x)
+        attn_out = self.attnk(x_norm, x_norm, x_norm, dim, mask)
+        out = self.Dense(attn_out) + x
+        return out
+    
+class AxialCrossAttentionBlock(nn.Module):
+    """
+    Axial Cross-Attention block with residual connection and RMSNorm.
+    Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
+    """
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+        super().__init__()  
+        self.model_dim = model_dim  
+        self.n_heads = n_heads  
+        self.n_kv_heads = n_kv_heads
+        self.causal = causal    
+        self.dropout_prob = dropout_prob
+        self.qk_norm = qk_norm
+        self.max_seq_len = max_seq_len
+        self.rope_embedder = rope_embedder
+        
+        self.attnk = AxialAttention(
+            inner_attn=Attention(
+                model_dim=model_dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                causal=causal,
+                dropout_prob=dropout_prob,
+                qk_norm=qk_norm,
+                max_seq_len=max_seq_len,
+                rope_embedder=rope_embedder
+            )
+        )
+        self.Dense = nn.Linear(model_dim, model_dim)
+        self.rmsnorm1 = nn.RMSNorm(model_dim)
+        self.rmsnorm2 = nn.RMSNorm(model_dim)
 
-# class AxialAttentionBlock(nn.Module):
-#     def __init__(self, model_dim, n_heads, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
-#         super().__init__()
-#         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
-#         self.d = model_dim
-#         self.n_heads = n_heads
-#         self.dropout_prob = dropout_prob
-#         self.qk_norm = qk_norm
-#         self.max_seq_len = max_seq_len
-#         self.rope_embedder = rope_embedder
-#         self.mha = MultiHeadAttention(model_dim=model_dim, 
-#                                       n_heads=n_heads, 
-#                                       dropout_prob=dropout_prob,
-#                                       qk_norm=qk_norm, 
-#                                       max_seq_len=max_seq_len, 
-#                                       rope_embedder=rope_embedder)
+    def forward(self,
+                x: torch.Tensor, 
+                context: torch.Tensor,
+                dim: int, 
+                mask: Optional[torch.Tensor] = None):
+        """
+        x: (B, dim1, ..., dimN, D)
+        context: (B, dim1, ..., dimM, D)
+        dim: int, the dimension along which attention is applied
+        mask: Optional[torch.Tensor], attention mask
+        """
+        x = self.rmsnorm1(x)
+        context = self.rmsnorm2(context)
+        attn_out = self.attnk(x, context, context, dim, mask)
+        out = self.Dense(attn_out) + x
+        return out
 
-#     def forward(self, q, k, v, dim, mask):
-#         """
-#         Axial attention along dim axis.
-#         Args:
-#             q: (B, T_q, D) queries
-#             k: (B, T_k, D) keys
-#             v: (B, T_k, D) values
-#             dim: int dimension along which the attention should be applied
-#             mask: (B, 1, T_q, T_k) or broadcastable mask
-#         Returns:
-#             y: (B, T_q, D) attention output
-#             A: (B, n_heads, T_q, T_k) attention weights
-#         """
+class FeedForwardBlock(nn.Module):
+    """
+    Feed-Forward block with residual connection and RMSNorm.
+    Uses SwiGLU nonlinearity.
+    """
+    def __init__(self, model_dim):
+        super().__init__()
+        self.model_dim = model_dim
+        self.Dense1 = nn.Linear(model_dim, model_dim*4)
+        self.Dense2 = nn.Linear(model_dim*4, model_dim)
+        self.rmsnorm = nn.RMSNorm(model_dim)
+        self.nonlinearity = SwiGLU(model_dim*4, model_dim*4)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.rmsnorm(x)
+        x = self.Dense2(self.nonlinearity(self.Dense1(x))) + x
+        return x
+    
+class AxialTransformerEncoderBlock(nn.Module):
+    """
+    Axial Transformer Encoder block with Axial Self-Attention and Feed-Forward Network.
+    Operates along a chosen 1D axis of a N-D tensor (B, dim 1, ..., dim N, D).
+    """
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+        super().__init__()
+        self.model_dim = model_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.causal = causal
+        self.dropout_prob = dropout_prob
+        self.qk_norm = qk_norm
+        self.max_seq_len = max_seq_len
+        self.rope_embedder = rope_embedder
+        self.attn_block = AxialSelfAttentionBlock(
+            model_dim=model_dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            causal=causal,
+            dropout_prob=dropout_prob,
+            qk_norm=qk_norm,
+            max_seq_len=max_seq_len,
+            rope_embedder=rope_embedder
+        )
+        self.ffn_block = FeedForwardBlock(model_dim=model_dim)
+    
+    def forward(self, x: torch.Tensor, dim: int, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.attn_block(x, dim, mask)
+        x = self.ffn_block(x)
+        return x    
