@@ -1,9 +1,11 @@
 import torch
+from enum import Enum
 import math
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
+
 
 # Todo: verify the implementation of SwiGLU numically matches the paper
 class SwiGLU(nn.Module):
@@ -257,6 +259,102 @@ class AxialEncoderBlock(nn.Module):
         x = self.attn_block(x, dim, mask)
         x = self.ffn_block(x)
         return x    
+
+class LayerType(Enum):
+    SPATIAL = "spatial"
+    TEMPORAL = "temporal"
+
+class EfficientTransformerBlock(nn.Module):
+    """
+    A block composed of spatial and/or temporal axial-attention layers,
+    in the order specified by `layer_types`.
+
+    Expected input:
+        x: (B, T, S, D)
+            B = batch size
+            T = temporal dimension
+            S = spatial dimension (e.g., patches)
+            D = embedding dimension
+
+    Args:
+        model_dim: embedding dimension D
+        n_heads: number of attention heads
+        n_kv_heads: number of key/value heads
+        max_seq_len: maximum sequence length for RoPE
+        dropout_prob: dropout probability
+        qk_norm: enable QK normalization
+        layer_types: sequence of LayerType enums defining the order of layers
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        max_seq_len: int,
+        dropout_prob: float = 0.0,
+        qk_norm: bool = True,
+        layer_types: Optional[List[LayerType]] = None,
+    ):
+        super().__init__()
+
+        # Default block: 3 spatial layers + 1 temporal layer
+        if layer_types is None:
+            layer_types = [
+                LayerType.SPATIAL,
+                LayerType.SPATIAL,
+                LayerType.SPATIAL,
+                LayerType.TEMPORAL,
+            ]
+
+        # Validate layer types
+        if not all(isinstance(t, LayerType) for t in layer_types):
+            raise TypeError("layer_types must be a list of LayerType enums")
+
+        self.layer_types = layer_types
+        self.model_dim = model_dim
+
+        # Shared RoPE embedder
+        self.rope = RopeEmbedding(model_dim//n_heads, max_seq_len)
+
+        # Factory to build Axial blocks
+        def make_layer():
+            return AxialEncoderBlock(
+                model_dim=model_dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                dropout_prob=dropout_prob,
+                qk_norm=qk_norm,
+                max_seq_len=max_seq_len,
+                rope_embedder=self.rope,
+            )
+
+        # One block per layer specification
+        self.layers = nn.ModuleList([make_layer() for _ in layer_types])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        temporal_mask: Optional[torch.Tensor] = None,
+        spatial_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: input tensor of shape (B, T, S, D)
+            temporal_mask: (T, T) or (B, T, T)
+            spatial_mask: (S, S) or (B, S, S)
+        """
+        # Basic shape check
+        assert x.size(-1) == self.model_dim, \
+            f"Expected last dim = {self.model_dim}, got {x.size(-1)}"
+
+        for layer_type, layer in zip(self.layer_types, self.layers):
+            if layer_type == LayerType.SPATIAL:
+                x = layer(x, dim=2, mask=spatial_mask)
+            else:  # LayerType.TEMPORAL
+                x = layer(x, dim=1, mask=temporal_mask)
+
+        return x
     
 class AxialCrossAttentionBlock(nn.Module):
     """

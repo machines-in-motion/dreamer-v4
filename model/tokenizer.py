@@ -1,109 +1,11 @@
 import torch
-from enum import Enum
-import math
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, List
-from .blocks import AxialSelfAttentionBlock, FeedForwardBlock, RopeEmbedding, AxialEncoderBlock
+from typing import Optional
+from .blocks import EfficientTransformerBlock
 from .utils import create_temporal_mask, create_encoder_spatial_mask, create_decoder_spatial_mask
 from dataclasses import dataclass
 
-class LayerType(Enum):
-    SPATIAL = "spatial"
-    TEMPORAL = "temporal"
-
-class EfficientTransformerBlock(nn.Module):
-    """
-    A block composed of spatial and/or temporal axial-attention layers,
-    in the order specified by `layer_types`.
-
-    Expected input:
-        x: (B, T, S, D)
-            B = batch size
-            T = temporal dimension
-            S = spatial dimension (e.g., patches)
-            D = embedding dimension
-
-    Args:
-        model_dim: embedding dimension D
-        n_heads: number of attention heads
-        n_kv_heads: number of key/value heads
-        max_seq_len: maximum sequence length for RoPE
-        dropout_prob: dropout probability
-        qk_norm: enable QK normalization
-        layer_types: sequence of LayerType enums defining the order of layers
-    """
-
-    def __init__(
-        self,
-        model_dim: int,
-        n_heads: int,
-        n_kv_heads: int,
-        max_seq_len: int,
-        dropout_prob: float = 0.0,
-        qk_norm: bool = True,
-        layer_types: Optional[List[LayerType]] = None,
-    ):
-        super().__init__()
-
-        # Default block: 3 spatial layers + 1 temporal layer
-        if layer_types is None:
-            layer_types = [
-                LayerType.SPATIAL,
-                LayerType.SPATIAL,
-                LayerType.SPATIAL,
-                LayerType.TEMPORAL,
-            ]
-
-        # Validate layer types
-        if not all(isinstance(t, LayerType) for t in layer_types):
-            raise TypeError("layer_types must be a list of LayerType enums")
-
-        self.layer_types = layer_types
-        self.model_dim = model_dim
-
-        # Shared RoPE embedder
-        self.rope = RopeEmbedding(model_dim//n_heads, max_seq_len)
-
-        # Factory to build Axial blocks
-        def make_layer():
-            return AxialEncoderBlock(
-                model_dim=model_dim,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                dropout_prob=dropout_prob,
-                qk_norm=qk_norm,
-                max_seq_len=max_seq_len,
-                rope_embedder=self.rope,
-            )
-
-        # One block per layer specification
-        self.layers = nn.ModuleList([make_layer() for _ in layer_types])
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        temporal_mask: Optional[torch.Tensor] = None,
-        spatial_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: input tensor of shape (B, T, S, D)
-            temporal_mask: (T, T) or (B, T, T)
-            spatial_mask: (S, S) or (B, S, S)
-        """
-        # Basic shape check
-        assert x.size(-1) == self.model_dim, \
-            f"Expected last dim = {self.model_dim}, got {x.size(-1)}"
-
-        for layer_type, layer in zip(self.layer_types, self.layers):
-            if layer_type == LayerType.SPATIAL:
-                x = layer(x, dim=2, mask=spatial_mask)
-            else:  # LayerType.TEMPORAL
-                x = layer(x, dim=1, mask=temporal_mask)
-
-        return x
-    
 @dataclass
 class CausalTokenizerConfig:
     num_modality_tokens: int
@@ -199,5 +101,40 @@ class CausalTokenizerDecoder(nn.Module):
             x = layer(x, temporal_mask=temporal_mask, spatial_mask=self.spatial_mask)
         return x[:, :, :self.cfg.num_modality_tokens,...]
         
+
+
+class ImagePatchifier(nn.Module):
+    def __init__(self, patch_size, model_dim, input_channels=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.input_channels = input_channels
+        self.model_dim = model_dim
+        self.cnn = nn.Conv2d(input_channels, model_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        assert x.dim()== 5, 'Input should be of shape BxTxCxHxW'
+        assert x.shape[-3] == self.input_channels, f'The number of image channels {x.shape[-3]}, does not match the number of input channels {self.input_channels}'
+        B, T, C, H, W = x.shape
+        x = x.view(-1, C, H, W)
+        x = self.cnn(x).flatten(-2, -1).transpose(-2, -1).view(B, T, -1, self.model_dim)
+        return x
+    
+class TokensToImageHead(nn.Module):
+    def __init__(self, model_dim, img_size, patch_size):
+        super().__init__()
+        self.img_size = img_size  # (H, W)
+        self.patch_size = patch_size  # p
+        self.num_patches_h = img_size[0] // patch_size
+        self.num_patches_w = img_size[1] // patch_size
+        self.conv = nn.Conv2d(model_dim, 3 * (patch_size ** 2), kernel_size=1)  # (B, D, h, w) -> (B, 3*p^2, h, w)
+        self.pixel_shuffle = nn.PixelShuffle(patch_size)  # (B, 3*p^2, h, w) -> (B, 3, H, W)
+
+    def forward(self, x):  # x: (B, T, N_modality, D)
+        B, T, N, D = x.shape
+        x = x.transpose(-1, -2)  # (B, T, D, N)
+        x = x.contiguous().view(-1, D, self.num_patches_h, self.num_patches_w)  # (B*T, D, h, w)
+        x = self.conv(x)  # (B, 3*p^2, h, w)
+        x = self.pixel_shuffle(x)  # (B, 3, H, W)
+        return x.view(B, T, 3, self.img_size[0], self.img_size[1])
         
     
