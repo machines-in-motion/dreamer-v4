@@ -104,27 +104,27 @@ class EfficientTransformerBlock(nn.Module):
 
         return x
     
-
 @dataclass
 class CausalTokenizerConfig:
     num_modality_tokens: int
     num_latent_tokens: int
     max_context_lenghth: int
-    num_input_channels: int
     model_dim: int
     latent_dim: int
-    num_layers: int
+    enc_num_layers: int 
+    dec_num_layers: int 
     n_heads: int
     n_kv_heads: Optional[int] = None
     dropout_prob: float = 0.0
     qk_norm: bool = True
+    patch_size: int = 14
 
 class CausalTokenizerEncoder(nn.Module):
     def __init__(self, cfg: CausalTokenizerConfig):
         super().__init__()
         self.cfg = cfg
         model_dim = cfg.model_dim
-        num_layers = cfg.num_layers
+        num_layers = cfg.enc_num_layers
         self.num_spatial_tokens = cfg.num_modality_tokens + cfg.num_latent_tokens 
         self.max_seq_len = max(cfg.max_context_lenghth, self.num_spatial_tokens)
         self.layers = nn.ModuleList( [EfficientTransformerBlock(model_dim=model_dim,
@@ -137,7 +137,6 @@ class CausalTokenizerEncoder(nn.Module):
         self.learned_latent_tokens = nn.Parameter(torch.randn(1, 1, cfg.num_latent_tokens, model_dim))
         self.spatial_mask = create_encoder_spatial_mask(cfg.num_modality_tokens,
                                                         cfg.num_latent_tokens)
-        self.input_proj = nn.Linear(cfg.num_input_channels, model_dim) # assuming input has 3 channels (e.g., RGB images)
         self.output_proj = nn.Linear(self.cfg.model_dim, cfg.latent_dim) # project to latent dim (smaller than model dim)
         self.output_nonlinearity = nn.Tanh()
 
@@ -145,7 +144,6 @@ class CausalTokenizerEncoder(nn.Module):
         
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         B, T, S, D = x.shape
-        x = self.input_proj(x)  # project input to model dim
         # Append learned latent tokens at the end of each modality sequence
         x = torch.cat([x,
                        self.learned_latent_tokens.expand(B, T, -1, -1)], dim=2)  # B, T, S+N_latent, D
@@ -156,7 +154,7 @@ class CausalTokenizerEncoder(nn.Module):
             temporal_mask = None
         for layer in self.layers:
             x = layer(x, temporal_mask=temporal_mask, spatial_mask=self.spatial_mask)
-        x = self.output_proj(x)
+        x = self.output_nonlinearity(self.output_proj(x))
         return x[:, :,self.cfg.num_modality_tokens:,:], x[:, :,:self.cfg.num_modality_tokens,:] # Latents, patch embeddings
     
 class CausalTokenizerDecoder(nn.Module):
@@ -164,7 +162,7 @@ class CausalTokenizerDecoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         model_dim = cfg.model_dim
-        num_layers = cfg.num_layers
+        num_layers = cfg.dec_num_layers
         self.num_spatial_tokens = cfg.num_modality_tokens + cfg.num_latent_tokens 
         self.max_seq_len = max(cfg.max_context_lenghth, self.num_spatial_tokens)
         self.layers = nn.ModuleList( [EfficientTransformerBlock(model_dim=model_dim,
@@ -178,7 +176,6 @@ class CausalTokenizerDecoder(nn.Module):
         self.spatial_mask = create_decoder_spatial_mask(cfg.num_modality_tokens,
                                                         cfg.num_latent_tokens)
         self.input_proj = nn.Linear(cfg.latent_dim, cfg.model_dim) # project to model dim
-        self.output_proj = nn.Linear(self.cfg.model_dim, cfg.num_input_channels) # project back to input channels (e.g., RGB)
     
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         assert x.dim() == 4, "Input tensor must be 4-dimensional (B, T, S, D)"
@@ -200,8 +197,7 @@ class CausalTokenizerDecoder(nn.Module):
             temporal_mask = None
         for layer in self.layers:
             x = layer(x, temporal_mask=temporal_mask, spatial_mask=self.spatial_mask)
-        x = self.output_proj(x)
-        return x
+        return x[:, :, :self.cfg.num_modality_tokens,...]
         
         
     
