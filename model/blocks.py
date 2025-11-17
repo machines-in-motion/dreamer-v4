@@ -65,7 +65,7 @@ class Attention(nn.Module):
     """
     Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
     """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=False):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
@@ -76,11 +76,13 @@ class Attention(nn.Module):
         self.rope_embedder = rope_embedder
         self.qk_norm = qk_norm
         self.causal = causal
+        self.flash_attention = flash_attention
         self.W_q = nn.Linear(self.d, self.d, bias=False)
         self.W_k = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
         self.W_v = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
         self.W_o = nn.Linear(self.d, self.d, bias=False)
-        self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)), dtype=torch.float32)) # The normalization constant in QK-Norm is active.
+        if not flash_attention:
+            self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)), dtype=torch.float32)) # The normalization constant in QK-Norm is active.
 
     def forward(self,
                  q: torch.Tensor,
@@ -103,12 +105,12 @@ class Attention(nn.Module):
             mask = mask.to(torch.bool)
         B, T_q, _ = q.shape
         B, T_k, _ = k.shape
-        Q = self.W_q(q) # BxTx3d
-        K = self.W_k(k) # BxTx3d
-        V = self.W_v(v) # BxTx3d
-        Q = Q.view(B, T_q, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
-        K = K.view(B, T_k, self.n_kv_heads, self.dk).transpose(1,2) # Bxn_kvxT_kxd
-        V = V.view(B, T_k, self.n_kv_heads, self.dk).transpose(1,2) # Bxn_kvxT_kxd
+        Q = self.W_q(q) # BxTxd
+        K = self.W_k(k) # BxTxdk
+        V = self.W_v(v) # BxTxdk
+        Q = Q.view(B, T_q, self.n_heads, self.dk).transpose(1,2).contiguous() # BxhxTxd
+        K = K.view(B, T_k, self.n_kv_heads, self.dk).transpose(1,2).contiguous() # Bxn_kvxT_kxd
+        V = V.view(B, T_k, self.n_kv_heads, self.dk).transpose(1,2).contiguous() # Bxn_kvxT_kxd
         # Normalize the features per head if qk_norm is active
         if self.qk_norm:
             Q = F.normalize(Q, dim=-1)
@@ -116,15 +118,25 @@ class Attention(nn.Module):
 
         if self.rope_embedder is not None:
             Q, K = self.rope_embedder(Q, K)
-
-        Y = F.scaled_dot_product_attention(
-            Q, K, V,
-            attn_mask=mask, 
-            dropout_p=self.dropout_prob if self.training else 0.0,
-            is_causal=self.causal,
-            scale = self.g,
-            enable_gqa= False if self.n_kv_heads == self.n_heads else True,
-        )  # [B, n_heads, Tq, dk]
+        
+        if self.flash_attention:
+            Y = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=mask, 
+                dropout_p=self.dropout_prob if self.training else 0.0,
+                is_causal=self.causal,
+                scale = None,
+                enable_gqa= False if self.n_kv_heads == self.n_heads else True,
+            )  # [B, n_heads, Tq, dk]
+        else:
+            Y = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=mask, 
+                dropout_p=self.dropout_prob if self.training else 0.0,
+                is_causal=self.causal,
+                scale = self.g,
+                enable_gqa= False if self.n_kv_heads == self.n_heads else True,
+            )  # [B, n_heads, Tq, dk]
         Y = Y.transpose(1, 2).contiguous().view(B, T_q, self.d)
         Y = self.W_o(Y)
         return Y

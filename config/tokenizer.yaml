@@ -11,14 +11,14 @@ tokenizer:
   dec_num_layers: 4        # Causal tokenizer decoder depth
   n_heads: 8
   n_kv_heads: 8
-  dropout_prob: 0.1
+  dropout_prob: 0.0
   qk_norm: true
   patch_size: 14
 
 train:
   output_dir: checkpoints
-  batch_size: 2
-  accum_grad_steps: 4
+  batch_size: 1
+  accum_grad_steps: 1
   lr: 1e-4
   num_workers: 32
   evaluate_every: 5000
