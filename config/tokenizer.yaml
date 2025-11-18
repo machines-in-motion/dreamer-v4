@@ -1,14 +1,40 @@
 defaults:
  - dataset: pushT
 
+reload_checkpoint: null
+output_dir: checkpoints
+evaluate_every: 5000
+save_every: 20000
+plot_every: 20000
+print_every: 50
+
+augmentation:
+  enable: false
+
+  gaussian_blur:
+    kernel_size: [3, 3]            # tuple in code → list in YAML
+    sigma_range: [0.1, 2.0]
+    application_probability: 0.5
+
+  color_jitter:
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+    application_probability: 0.5
+
+  random_noise:
+    mean: 0.0
+    std: 0.05
+
 tokenizer:
-  num_modality_tokens: 256 # Number of tokens for the image or other modalities
-  num_latent_tokens: 512    # The number of latent tokens per frame
-  max_context_length: 192  # The maximum temporal horizon of the tokenizer
-  model_dim: 768          # The dimension of the transformer latents
-  latent_dim: 16          # The dimention of the encoder output latents (z)
-  enc_num_layers: 4        # Causal tokenizer encoder depth
-  dec_num_layers: 4        # Causal tokenizer decoder depth
+  num_modality_tokens: 256    # Number of tokens for the image or other modalities
+  num_latent_tokens: 512      # The number of latent tokens per frame
+  max_context_length: 64      # The maximum temporal horizon of the tokenizer
+  model_dim: 768              # The dimension of the transformer latents
+  latent_dim: 16              # The dimention of the encoder output latents (z)
+  enc_num_layers: 4           # Causal tokenizer encoder depth
+  dec_num_layers: 4           # Causal tokenizer decoder depth
   n_heads: 8
   n_kv_heads: 8
   dropout_prob: 0.0
@@ -16,19 +42,20 @@ tokenizer:
   patch_size: 14
 
 train:
-  output_dir: checkpoints
+  device: 'cuda:0'
+  num_epochs: 1
   batch_size: 1
   accum_grad_steps: 1
   lr: 1e-4
-  num_workers: 32
-  evaluate_every: 5000
-  save_every: 20000
-  plots_every: 20000
+  num_workers: 8
   lpips_weight: 0.2
   num_training_steps: 1e7
-
+  mixed_precision: false
+  torch_compile_mode: "default"
+  enable_flash_attention: false
+  enable_fast_matmul: true
 
 wandb:
-  enabled: false # Enable or disable wandb logging
+  enabled: false 
   project: "dreamerv4-tokenizer" # Replace with your wandb project name
 
