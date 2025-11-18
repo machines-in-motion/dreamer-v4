@@ -8,7 +8,6 @@ class SingleViewSequenceDataset(Dataset):
     """
     Fast dataset for a single HDF5 sequence.
     Each HDF5 file = one trajectory (len_traj, C, H, W).
-    Later you can wrap many of these in ConcatDataset.
     """
 
     def __init__(

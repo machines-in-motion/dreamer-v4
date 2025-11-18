@@ -143,12 +143,12 @@ class Attention(nn.Module):
 
 class AxialAttention(nn.Module):
     """
-    Axial wrapper around your Attention block.
+    Axial wrapper around the Attention block.
     Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
     """
     def __init__(
         self,
-        inner_attn: nn.Module,                      # your Attention(...)
+        inner_attn: nn.Module,                      # Attention(...)
     ):
         super().__init__()
         self.attn = inner_attn  # expects (B*, T, D) → (B*, T, D)
