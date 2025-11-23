@@ -39,7 +39,6 @@ def save_checkpoint(
     dec: FSDP,
     optim: torch.optim.Optimizer,
     scheduler,
-    rms_norm: RMSLossScaler,
     rank: int,
     wandb_run_id: str = None,
     log_dir: str = None,
@@ -68,7 +67,6 @@ def save_checkpoint(
             "dec": dec_state,
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "rms_norm": rms_norm.ema_sq,
             "wandb_run_id": wandb_run_id,
             "log_dir": log_dir,
         }
@@ -82,7 +80,6 @@ def load_checkpoint(
     dec: FSDP,
     optim: torch.optim.Optimizer,
     scheduler,
-    rms_norm: RMSLossScaler,
     rank: int,
     device: torch.device,
 ):
@@ -122,9 +119,6 @@ def load_checkpoint(
 
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])
-
-    # Restore RMS loss scaler state
-    rms_norm.ema_sq = ckpt.get("rms_norm", {})
 
     if rank == 0:
         print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}")
@@ -743,9 +737,6 @@ def main():
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
-    # RMS loss normalizer for tokenizer losses
-    rms_norm = RMSLossScaler(decay=0.99, eps=1e-8)
-
     RESUME_TRAINING = False
     wandb_run_id = None
     log_dir = None
@@ -760,7 +751,6 @@ def main():
             dec=dec,
             optim=optim,
             scheduler=scheduler,
-            rms_norm=rms_norm,
             rank=rank,
             device=device,
         )
@@ -978,7 +968,6 @@ def main():
                         dec=dec,
                         optim=optim,
                         scheduler=scheduler,
-                        rms_norm=rms_norm,
                         rank=rank,
                         wandb_run_id=wandb_run_id,
                         log_dir=log_dir,
@@ -1047,7 +1036,6 @@ def main():
             dec=dec,
             optim=optim,
             scheduler=scheduler,
-            rms_norm=rms_norm,
             rank=rank,
             wandb_run_id=wandb_run_id,
             log_dir=log_dir,
