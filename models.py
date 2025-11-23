@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.checkpoint import checkpoint
+import numpy as np
 
 # --------- Utilities ---------
 
@@ -347,6 +348,7 @@ class DreamerV4Encoder(nn.Module):
         temporal_every: int = 1,  # 1 => alternate: spatial, temporal, spatial, temporal, ...
         in_channels: int = 3,
         mae_max_mask_prob: float = 0.9,
+        activate_masking: bool = False
     ):
         super().__init__()
         H, W = image_size
@@ -357,6 +359,7 @@ class DreamerV4Encoder(nn.Module):
         self.Nl = n_latents
         self.d = d_model
         self.mae_max_mask_prob = mae_max_mask_prob
+        self.activate_masking = activate_masking
 
         # Patch embedding via Conv2d (kernel=stride=patch_size)
         self.patch_embed = nn.Conv2d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
@@ -402,7 +405,7 @@ class DreamerV4Encoder(nn.Module):
         tok = tok.view(B, T, self.Np, self.d)
         return tok
 
-    def forward(self, video: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, video: torch.Tensor, mask = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         video: [B, T, C, H, W]
         Returns:
@@ -417,7 +420,7 @@ class DreamerV4Encoder(nn.Module):
         P = self.patchify(video)  # [B,T,Np,d]
 
         # --- Masked Autoencoding (MAE) patch dropout, as in DreamerV4 ---
-        if self.training and self.mae_max_mask_prob > 0.0:
+        if (self.training or self.activate_masking) and self.mae_max_mask_prob > 0.0:
             B, T, Np, D = P.shape
 
             # Sample per-(B,T) dropout probability p ~ U(0, mae_max_mask_prob)
@@ -427,7 +430,7 @@ class DreamerV4Encoder(nn.Module):
             # For each patch in each frame, sample Bernoulli with prob=drop_p[b, t]
             # rand: [B, T, Np]
             rand = torch.rand(B, T, Np, device=P.device, dtype=P.dtype)
-            mask = rand < drop_p.unsqueeze(-1)  # bool [B, T, Np]
+            mask = rand < drop_p.unsqueeze(-1) if mask is None else mask  # bool [B, T, Np]
 
             # Replace masked patches with learned mask_token
             # mask.unsqueeze(-1): [B, T, Np, 1] -> broadcast over channel dimension
@@ -447,7 +450,10 @@ class DreamerV4Encoder(nn.Module):
 
         # Bottleneck readout from latents: d -> d_b + tanh
         Z = torch.tanh(self.down_proj(L_enc))  # [B,T,Nl,d_b]
-        return P_enc, L_enc, Z
+        if self.activate_masking:
+            return P_enc, L_enc, Z, mask
+        else:
+            return P_enc, L_enc, Z
 
 class BlockCausalDecoderLayer(nn.Module):
     """
@@ -668,139 +674,171 @@ class DreamerV4Decoder(nn.Module):
         x_hat = patches.view(B_, T_, self.H, self.W, self.C).permute(0,1,4,2,3).contiguous()  # [B,T,C,H,W]
         return R_dec, x_hat
 
-if __name__ == "__main__":
-    import os, time, math
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
+class BlockCausalDynamicsLayer(nn.Module):
+    """
+    A single layer of the Dynamics Transformer.
+    Alternates between Spatial Attention (mixing tokens within a frame) 
+    and Temporal Attention (mixing history for a specific token position).
+    """
+    def __init__(self, d_model, num_heads, seq_len, num_tokens, dropout=0.0, mlp_ratio=4.0, temporal=False):
+        super().__init__()
+        self.d_model = d_model
+        self.temporal = temporal
+        
+        self.norm1 = nn.RMSNorm(d_model)
+        # Dynamics has a single stream of tokens, so we use Self-Attention (Hq=Hkv)
+        self.attn = MHA_GQA(
+            d_model=d_model,
+            num_heads_q=num_heads,
+            num_heads_kv=num_heads,
+            head_dim=d_model // num_heads,
+            dropout=dropout,
+            max_seq_len=seq_len if temporal else num_tokens
+        )
+        
+        self.norm2 = nn.RMSNorm(d_model)
+        self.ffn = FeedForwardSwiGLU(d_model, int(d_model * mlp_ratio * 2 / 3), dropout=dropout)
+        
+        self.dropout = nn.Dropout(dropout)
 
-    # --- Repro and device ---
-    torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True  # speed on fixed shapes
-        torch.set_float32_matmul_precision("high")
+    def forward(self, x):
+        # x: (B, T, N, D)
+        B, T, N, D = x.shape
+        
+        skip = x
+        x = self.norm1(x)
+        
+        if self.temporal:
+            # Temporal Attention: Independent per token index 'n', causal over 't'
+            # Reshape to (B*N, T, D) to treat each token position as a separate sequence
+            x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
+            x = self.attn(x, x, is_causal=True)
+            x = x.view(B, N, T, D).permute(0, 2, 1, 3)
+        else:
+            # Spatial Attention: Independent per timestep 't', dense over 'n'
+            # Reshape to (B*T, N, D) to treat each frame as a separate sequence
+            x = x.view(B * T, N, D)
+            x = self.attn(x, x, is_causal=False)
+            x = x.view(B, T, N, D)
+            
+        x = self.dropout(x)
+        x = x + skip
+        
+        skip = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = self.dropout(x)
+        x = x + skip
+            
+        return x
 
-    # --- Hyperparameters from the Minecraft VPT setting (paper) ---
-    # VPT video: 360x640@20FPS; zero-pad H to 384 for 16x16 patches => 960 patches/frame
-    IMG_H, IMG_W = 384, 640                 # paper: zero-padded 360->384 height for patchify
-    PATCH = 16                              # paper: 16x16 patches
-    CONTEXT_T = 192                         # paper: context length 192 for Minecraft
-    N_LATENTS = 512                         # inferred from “Nb 512 × Db 16 -> Nz 256 × 32”
-    BOTTLENECK_D = 16                       # inferred bottleneck channel “Db 16”
+class DreamerV4Dynamics(nn.Module):
+    def __init__(
+        self,
+        action_dim: int,
+        num_latents: int,      # Number of spatial tokens (z) per frame (e.g., 256)
+        latent_dim: int,       # Dimension of the bottleneck (db) (e.g., 32)
+        d_model: int = 1024,
+        num_layers: int = 12,
+        num_heads: int = 16,
+        num_registers: int = 4,
+        seq_len: int = 96,    # Context length
+        dropout: float = 0.1,
+        mlp_ratio: float = 4.0,
+        num_tau_levels: int = 128,  # For discrete noise level embedding
+        temporal_every: int = 4       # Apply temporal attention every K layers
+    ):
+        super().__init__()
+        num_step_levels = int(np.log2(num_tau_levels))
+        self.num_latents = num_latents
+        self.latent_dim = latent_dim
+        self.d_model = d_model
+        self.num_registers = num_registers
+        
+        # --- Embeddings ---
+        # 1. Action Embedding (Continuous vector)
+        self.act_proj = nn.Linear(action_dim, d_model)
+        
+        # 2. Noise/Step Embedding
+        # Paper: "encode each with a discrete embedding lookup and concatenate their channels"
+        # We embed sigma and step to d_model/2 and concat to get d_model.
+        self.sigma_embed = nn.Embedding(num_tau_levels, d_model // 2)
+        self.step_embed = nn.Embedding(num_step_levels, d_model // 2)
+        
+        # 3. Latent Projection (db -> d_model)
+        self.z_proj = nn.Linear(latent_dim, d_model)
+        
+        # 4. Register Tokens (Learned)
+        self.register_tokens = nn.Parameter(torch.randn(num_registers, d_model) * 0.02)
+        
+        # --- Transformer ---
+        layers = []
+        # Total tokens per timestep: 1 (Action) + 1 (Sigma/Step) + Registers + Latents
+        self.num_tokens_per_step = 1 + 1 + num_registers + num_latents
+        
+        for i in range(num_layers):
+            # Follows paper's logic: Temporal only every 4 layers (default), otherwise Spatial
+            # Note: This simple logic puts temporal at indices 3, 7, 11...
+            is_temporal = ((i + 1) % temporal_every == 0)
+            
+            layers.append(BlockCausalDynamicsLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                seq_len=seq_len,
+                num_tokens=self.num_tokens_per_step,
+                dropout=dropout,
+                mlp_ratio=mlp_ratio,
+                temporal=is_temporal,
+            ))
+        self.layers = nn.ModuleList(layers)
+        
+        # --- Output Head ---
+        # Predict clean representations (x-prediction)
+        self.out_proj = nn.Linear(d_model, latent_dim)
 
-    # --- Model capacity choices (unknown in the paper; set to reasonable defaults) ---
-    D_MODEL = 768                           # unknown in paper; moderate width for testing
-    N_LAYERS = 12                           # unknown in paper; fewer layers for quicker profiling
-    HEADS_Q = 12                            # unknown in paper; typical head count
-    HEADS_KV_LATENT = 12 # 4                # unknown in paper; uses GQA with Hq/G=3
-    MLP_RATIO = 4.0                         # paper mentions SwiGLU/MLP; exact ratio unspecified
-    TEMPORAL_EVERY = 4                      # paper: temporal attention every 4 layers
-    IN_CH = 3                               # RGB frames
-
-    # --- Instantiate encoder/decoder from this file ---
-    enc = DreamerV4Encoder(
-        image_size=(IMG_H, IMG_W),
-        patch_size=PATCH,
-        d_model=D_MODEL,
-        n_layers=N_LAYERS,
-        num_heads_q=HEADS_Q,
-        num_heads_kv_latent=HEADS_KV_LATENT,
-        seq_len=CONTEXT_T,
-        mlp_ratio=MLP_RATIO,
-        dropout=0.0,
-        n_latents=N_LATENTS,
-        bottleneck_dim=BOTTLENECK_D,
-        temporal_every=TEMPORAL_EVERY,
-        in_channels=IN_CH,
-    ).to(device)  # architecture as specified for the tokenizer encoder
-
-    dec = DreamerV4Decoder(
-        image_size=(IMG_H, IMG_W),
-        patch_size=PATCH,
-        d_model=D_MODEL,
-        n_layers=N_LAYERS,
-        num_heads_q=HEADS_Q,
-        num_heads_kv_latent=HEADS_KV_LATENT,
-        bottleneck_dim=BOTTLENECK_D,
-        seq_len=CONTEXT_T,
-        mlp_ratio=MLP_RATIO,
-        dropout=0.0,
-        n_latents=N_LATENTS,
-        in_channels=IN_CH,
-        temporal_every=TEMPORAL_EVERY,
-    ).to(device)  # architecture as specified for the tokenizer decoder
-
-    # Optional: compile for speed (PyTorch 2.4+), may increase first-iteration time
-    #enc = torch.compile(enc, mode="reduce-overhead", fullgraph=False)  # optional
-    #dec = torch.compile(dec, mode="reduce-overhead", fullgraph=False)  # optional
-
-    # --- Dummy inputs ---
-    # Create dummy video matching VPT: BxTxCxHxW with H padded to 384 and W=640
-    BATCH = 1   # small batch for memory profiling
-    T = CONTEXT_T  # default to 192 context
-    x = torch.randn(BATCH, T, IN_CH, IMG_H, IMG_W, device=device)  # dummy frames
-
-    # If you want to compute loss only on the unpadded 360 rows (as VPT is 360x640), slice here
-    LOSS_REGION_H = 360  # paper: original video height before zero-pad
-
-    # --- Optimizer (unknown in paper; reasonable default) ---
-    params = list(enc.parameters()) + list(dec.parameters())
-    optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01)  # unknown in paper
-
-    learnable_params_enc = sum(p.numel() for p in enc.parameters() if p.requires_grad)
-    learnable_params_dec = sum(p.numel() for p in dec.parameters() if p.requires_grad)
-    print(f"Learnable parameters: {learnable_params_enc+learnable_params_dec}")
-
-    # --- Mixed precision autocast: bf16 on CUDA (H100/H200), else fp32 ---
-    use_cuda = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_cuda else torch.float32  # Hopper supports bf16 well
-
-    # --- Warmup (to stabilize kernels and caches) ---
-    enc.train(), dec.train()
-    WARMUP_ITERS = 3
-    for _ in range(WARMUP_ITERS):
-        optim.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=amp_dtype):
-            P_enc, L_enc, Z = enc(x)               # encoder forward
-            R_dec, x_hat = dec(Z)                  # decoder forward
-            loss = F.mse_loss(x_hat[:, :, :, :LOSS_REGION_H, :], x[:, :, :, :LOSS_REGION_H, :])  # MSE recon
-        loss.backward()
-        optim.step()
-        if use_cuda:
-            torch.cuda.synchronize()  # ensure warmup work is complete before timing
-
-    # --- Reset CUDA peak memory stats before timed iteration ---
-    if use_cuda:
-        torch.cuda.reset_peak_memory_stats()  # reset peak counters for clean measurement
-
-    # --- Timed training step (forward + loss + backward + step) ---
-    optim.zero_grad(set_to_none=True)
-    if use_cuda:
-        torch.cuda.synchronize()  # flush prior work before timing
-    t0 = time.perf_counter()
-    with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=amp_dtype):
-        P_enc, L_enc, Z = enc(x)                   # forward encoder
-        R_dec, x_hat = dec(Z)                      # forward decoder
-        loss = F.mse_loss(x_hat[:, :, :, :LOSS_REGION_H, :], x[:, :, :, :LOSS_REGION_H, :])  # MSE recon
-    loss.backward()                                # backward pass
-    optim.step()                                    # optimizer step
-    if use_cuda:
-        torch.cuda.synchronize()  # ensure all kernels done before stopping timer
-    t1 = time.perf_counter()
-    step_time = t1 - t0
-
-    # --- Throughput (frames/sec) ---
-    frames = BATCH * T
-    fps = frames / step_time
-    print(f"Training step: loss={loss.item():.6f}, time={step_time:.3f}s, frames={frames}, FPS={fps:.2f}")  # timing
-
-    # --- Memory report ---
-    if use_cuda:
-        cur_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
-        cur_resvd = torch.cuda.memory_reserved() / (1024 ** 3)
-        peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        print(f"CUDA memory: current_alloc={cur_alloc:.2f} GB, current_reserved={cur_resvd:.2f} GB, peak_alloc={peak_alloc:.2f} GB")  # memory
-        # Optional detailed summary:
-        # print(torch.cuda.memory_summary())  # comprehensive allocator stats
-
+    def forward(self,
+                action: torch.Tensor,
+                noisy_z: torch.Tensor,
+                sigma_idx: torch.Tensor,
+                step_idx: torch.Tensor):
+        """
+        Args:
+            action: (B, T, action_dim) - Actions taken at each step
+            noisy_z: (B, T, num_latents, latent_dim) - Corrupted representations
+            sigma_idx: (B, T) - Indices for noise level
+            step_idx: (B, T) - Indices for step size
+        Returns:
+            pred_z: (B, T, num_latents, latent_dim) - Predicted clean representations
+        """
+        B, T, _, _ = noisy_z.shape
+        
+        # 1. Prepare Embeddings
+        # Action: (B, T, 1, D)
+        emb_act = self.act_proj(action).unsqueeze(2)
+        
+        # Sigma/Step: (B, T, 1, D)
+        emb_sigma = self.sigma_embed(sigma_idx)
+        emb_step = self.step_embed(step_idx)
+        emb_noise = torch.cat([emb_sigma, emb_step], dim=-1).unsqueeze(2)
+        
+        # Registers: (B, T, Nr, D)
+        emb_reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
+        
+        # Latents: (B, T, Nl, D)
+        emb_z = self.z_proj(noisy_z)
+        
+        # 2. Interleave / Concatenate Inputs
+        # Order: [Action, Noise, Registers, Latents]
+        # Shape: (B, T, 1+1+Nr+Nl, D)
+        x = torch.cat([emb_act, emb_noise, emb_reg, emb_z], dim=2)
+        
+        # 3. Apply Transformer Layers
+        for layer in self.layers:
+            x = layer(x)
+            
+        # 4. Extract and Project Outputs
+        # We only need the predictions corresponding to the latent tokens (the last Nl tokens)
+        out_z_tokens = x[:, :, -self.num_latents:, :]
+        pred_z = self.out_proj(out_z_tokens)
+        
+        return pred_z
