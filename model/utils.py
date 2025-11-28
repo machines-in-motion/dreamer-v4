@@ -125,4 +125,4 @@ class TokenMasker(nn.Module):
             if mask is None:
                 mask = torch.zeros(B, T, N, dtype=torch.bool, device=x.device)
 
-        return x, mask
+        return x

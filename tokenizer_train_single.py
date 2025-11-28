@@ -111,7 +111,7 @@ class ModelWrapper(nn.Module):
         z, _ = self.encoder(masked_tokens)
         z_decoded = self.decoder(z)
         recon_images = self.image_head(z_decoded)
-        return  torch.clamp((recon_images + 1)/2., 0., 1.)
+        return  (recon_images + 1)/2.
 
 @hydra.main(config_path="config", config_name="tokenizer_small.yaml")
 def main(cfg: DictConfig):
@@ -215,8 +215,9 @@ def main(cfg: DictConfig):
         for batch in train_loader:
             step += 1
             # ctx_len = torch.randint(1, cfg.tokenizer.max_context_length,(1,)).item()
-            ctx_len = -1
-            imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
+            # ctx_len = -1
+            # imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
+            imgs = batch['observation.image'].to(torch.float32).to(device)
             if cfg.augmentation.enable:
                 B, T, C, H, W = imgs.shape
                 imgs = imgs.view(B*T, C, H, W).contiguous().to(device)      # flatten time
