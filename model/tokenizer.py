@@ -5,6 +5,7 @@ from typing import Optional
 from .blocks import EfficientTransformerBlock
 from .utils import create_temporal_mask, create_encoder_spatial_mask, create_decoder_spatial_mask
 from dataclasses import dataclass
+import math
 
 @dataclass
 class CausalTokenizerConfig:
@@ -58,7 +59,7 @@ class CausalTokenizerEncoder(nn.Module):
         # Learned latent tokens appended at the end of each modality sequence
         # Shape: (1, 1, N_latent, D_model)
         self.learned_latent_tokens = nn.Parameter(
-            torch.randn(1, 1, cfg.num_latent_tokens, model_dim)
+            torch.randn(1, 1, cfg.num_latent_tokens, model_dim) / math.sqrt(cfg.model_dim)
         )
 
         # Spatial mask is static → register as buffer so .to(device) moves it once
@@ -156,7 +157,7 @@ class CausalTokenizerDecoder(nn.Module):
         # Learned "modality" tokens that are prepended and will be decoded
         # Shape: (1, 1, S_mod, D_model)
         self.learned_modality_tokens = nn.Parameter(
-            torch.randn(1, 1, cfg.num_modality_tokens, model_dim)
+            torch.randn(1, 1, cfg.num_modality_tokens, model_dim)/math.sqrt(cfg.model_dim)
         )
 
         # Spatial mask (static)
@@ -197,7 +198,7 @@ class CausalTokenizerDecoder(nn.Module):
 
         # Prepend learned modality tokens
         # learned_modality_tokens: (1, 1, S_mod, D_model) -> (B, T, S_mod, D_model)
-        modality_tokens = self.learned_modality_tokens.expand(B, T, -1, -1)
+        modality_tokens = self.learned_modality_tokens.expand(B, T, -1, -1).contiguous()
         x = torch.cat([modality_tokens, x], dim=2)  # (B, T, S_mod + N_latent, D_model)
 
         # Temporal mask

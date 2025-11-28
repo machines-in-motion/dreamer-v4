@@ -2,14 +2,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def create_temporal_mask(T, device = "cpu"):
-    S = T
-    mask = torch.ones(S, S, dtype=torch.bool, device=device)
-    for t_q in range(T):
-        for t_k in range(T):
-            if t_k < t_q:
-                mask[t_q, t_k] = False
-    return mask
+# def create_temporal_mask(T, device = "cpu"):
+#     S = T
+#     mask = torch.ones(S, S, dtype=torch.bool, device=device)
+#     for t_q in range(T):
+#         for t_k in range(T):
+#             if t_k < t_q:
+#                 mask[t_q, t_k] = False
+#     return mask
+
+def create_temporal_mask(T: int, device: str = "cpu") -> torch.Tensor:
+    """
+    Standard causal mask for attention:
+      mask[q, k] = True  -> allowed (k <= q)
+      mask[q, k] = False -> masked out (k > q)
+    Shape: (T, T)
+    """
+    # Lower-triangular (including diagonal) is True
+    arange = torch.arange(T, device=device)
+    mask = arange.view(T, 1) >= arange.view(1, T)  # (q >= k)
+    return mask  # dtype=bool, shape (T, T)
 
 def create_encoder_spatial_mask(N_patch, N_latent, device="cpu"):
     S = N_patch + N_latent
@@ -36,28 +48,27 @@ def create_decoder_spatial_mask(N_patch, N_latent, device="cpu"):
 #             torch.zeros(1, 1, n_patches, model_dim)    # (1,1,N,D)
 #         )
 
-    # def forward(self, x):
-    #     """
-    #     x: (B, T, N, D)
-    #     """
-    #     B, T, N, D = x.shape
-    #     device = x.device
-    #     dtype = x.dtype
+#     def forward(self, x):
+#         """
+#         x: (B, T, N, D)
+#         """
+#         B, T, N, D = x.shape
+#         device = x.device
+#         dtype = x.dtype
 
-    #     # Sample mask probability p
-    #     p_min, p_max = self.mask_prob_range
-    #     p = torch.empty((), device=device).uniform_(p_min, p_max)
+#         # Sample mask probability p
+#         p_min, p_max = self.mask_prob_range
+#         p = torch.empty((), device=device).uniform_(p_min, p_max)
 
-    #     # mask shape: (B, 1, N, 1)
-    #     mask = torch.rand(B, T, N, 1, device=device) < p
+#         # mask shape: (B, 1, N, 1)
+#         mask = torch.rand(B, T, N, 1, device=device) < p
 
-    #     # Broadcast learned mask tokens to (B, T, N, D)
-    #     mask_tokens = self.learned_masks.expand(B, T, N, D)
+#         # Broadcast learned mask tokens to (B, T, N, D)
+#         mask_tokens = self.learned_masks.expand(B, T, N, D)
 
-    #     # Apply mask using torch.where (no in-place ops)
-    #     x = torch.where(mask, mask_tokens, x)
-    #     return x
-
+#         # Apply mask using torch.where (no in-place ops)
+#         x = torch.where(mask, mask_tokens, x)
+#         return x
 
 class TokenMasker(nn.Module):
     """
@@ -74,14 +85,14 @@ class TokenMasker(nn.Module):
         mask:     [B, T, N] boolean mask
     """
 
-    def __init__(self, model_dim, max_mask_prob=0.9, activate_masking=False):
+    def __init__(self, model_dim, max_mask_prob=0.9, activate_masking=True):
         super().__init__()
         self.max_mask_prob = max_mask_prob
         self.activate_masking = activate_masking
 
         # Single learned mask token (shared across patches)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, model_dim))
-        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
 
     def forward(self, x, mask=None):
         """
@@ -114,4 +125,4 @@ class TokenMasker(nn.Module):
             if mask is None:
                 mask = torch.zeros(B, T, N, dtype=torch.bool, device=x.device)
 
-        return x
+        return x, mask

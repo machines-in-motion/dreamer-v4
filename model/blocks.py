@@ -8,19 +8,19 @@ from typing import Tuple, Optional, List
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-class FeedForward(nn.Module):
-    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.0):
-        super().__init__()
-        self.fc1 = nn.Linear(d_model, d_hidden)
-        self.fc2 = nn.Linear(d_hidden, d_model)
-        self.dropout = nn.Dropout(dropout)
+# class FeedForward(nn.Module):
+#     def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.0):
+#         super().__init__()
+#         self.fc1 = nn.Linear(d_model, d_hidden)
+#         self.fc2 = nn.Linear(d_hidden, d_model)
+#         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.silu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+#     def forward(self, x):
+#         x = self.fc1(x)
+#         x = F.silu(x)
+#         x = self.dropout(x)
+#         x = self.fc2(x)
+#         return x
     
 class FeedForwardSwiGLU(nn.Module):
     """
@@ -45,30 +45,30 @@ class FeedForwardSwiGLU(nn.Module):
         h = self.drop(u * g)
         return self.down(h)
     
-class SwiGLU(nn.Module):
-    """
-    SwiGLU activation block from:
-    'GLU Variants Improve Transformer', Shazeer 2020.
+# class SwiGLU(nn.Module):
+#     """
+#     SwiGLU activation block from:
+#     'GLU Variants Improve Transformer', Shazeer 2020.
     
-    Computes: Swish(xW1) * (xW2)
-    """
-    def __init__(self, dim_in, dim_hidden):
-        super().__init__()
-        # Two linear projections: W and V in the paper
-        self.W = nn.Linear(dim_in, dim_hidden, bias=False)
-        self.V = nn.Linear(dim_in, dim_hidden, bias=False)
+#     Computes: Swish(xW1) * (xW2)
+#     """
+#     def __init__(self, dim_in, dim_hidden):
+#         super().__init__()
+#         # Two linear projections: W and V in the paper
+#         self.W = nn.Linear(dim_in, dim_hidden, bias=False)
+#         self.V = nn.Linear(dim_in, dim_hidden, bias=False)
 
-    def forward(self, x):
-        """
-        x: (B, T, D)
-        """
-        xW = self.W(x)                  # gate input
-        xV = self.V(x)                  # value input
+#     def forward(self, x):
+#         """
+#         x: (B, T, D)
+#         """
+#         xW = self.W(x)                  # gate input
+#         xV = self.V(x)                  # value input
 
-        # Swish(xW) = xW * sigmoid(xW)
-        swish_gate = xW * torch.sigmoid(xW)
+#         # Swish(xW) = xW * sigmoid(xW)
+#         swish_gate = xW * torch.sigmoid(xW)
 
-        return swish_gate * xV          # elementwise product
+#         return swish_gate * xV          # elementwise product
 
 class RopeEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048):
@@ -179,56 +179,137 @@ class Attention(nn.Module):
         Y = self.W_o(Y)
         return Y
 
+# class AxialAttention(nn.Module):
+#     """
+#     Axial wrapper around the Attention block.
+#     Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
+#     """
+#     def __init__(
+#         self,
+#         inner_attn: nn.Module,                      # Attention(...)
+#     ):
+#         super().__init__()
+#         self.attn = inner_attn  # expects (B*, T, D) → (B*, T, D)
+
+#     def forward(self,
+#                 q: torch.Tensor, 
+#                 k: torch.Tensor, 
+#                 v:torch.Tensor, 
+#                 dim: int, 
+#                 mask: Optional[torch.Tensor] = None):
+        
+#         dims_q = list(q.shape)
+#         assert dim > 0 and dim < q.dim(), "Dimension for attention must be between 1 and q.dim()-1"
+#         D = dims_q[-1]
+#         Tq_k = dims_q[dim]
+#         dims_kv = list(k.shape)
+#         Tk_k = dims_kv[dim]
+#         reordered_q = q.transpose(dim, -2).contiguous().view(-1, Tq_k, D)
+#         reordered_k = k.transpose(dim, -2).contiguous().view(-1, Tk_k, D)
+#         reordered_v = v.transpose(dim, -2).contiguous().view(-1, Tk_k, D)
+#         if mask is not None:
+#             assert mask.shape[-2] == q.shape[dim] and mask.shape[-1] == k.shape[dim], "Mask shape does not match the attention dimensions."
+#             if mask.dim() ==2:
+#                 mask = mask.unsqueeze(0)  # 1xTq xTk
+#         Y = self.attn(reordered_q, reordered_k, reordered_v, mask) #...xT_dimxD
+#         Y = Y.view((dims_q[:dim]+dims_q[dim+1:-1]+[dims_q[dim], D])).transpose(dim, -2).contiguous() # Verifiy if this line is actually needed
+#         return Y
+
 class AxialAttention(nn.Module):
     """
     Axial wrapper around the Attention block.
     Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
     """
-    def __init__(
-        self,
-        inner_attn: nn.Module,                      # Attention(...)
-    ):
+    def __init__(self, inner_attn: nn.Module):
         super().__init__()
-        self.attn = inner_attn  # expects (B*, T, D) → (B*, T, D)
+        self.attn = inner_attn  # expects (B*, T, D, ...) → (B*, T, D, ...)
 
-    def forward(self,
-                q: torch.Tensor, 
-                k: torch.Tensor, 
-                v:torch.Tensor, 
-                dim: int, 
-                mask: Optional[torch.Tensor] = None):
-        
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dim: int,
+        mask: Optional[torch.Tensor] = None,
+    ):
+        # q: (B, d1, ..., dN, D)
         dims_q = list(q.shape)
-        assert dim > 0 and dim < q.dim(), "Dimension for attention must be between 1 and q.dim()-1"
+        assert dim > 0 and dim < q.dim() - 1, "dim must be between 1 and q.dim()-2"
         D = dims_q[-1]
-        Tq_k = dims_q[dim]
-        dims_kv = list(k.shape)
-        Tk_k = dims_kv[dim]
-        reordered_q = q.transpose(dim, -2).contiguous().view(-1, Tq_k, D)
-        reordered_k = k.transpose(dim, -2).contiguous().view(-1, Tk_k, D)
-        reordered_v = v.transpose(dim, -2).contiguous().view(-1, Tk_k, D)
+        Tq = dims_q[dim]
+
+        dims_k = list(k.shape)
+        Tk = dims_k[dim]
+        assert dims_k[:-1] == dims_q[:-1], "q and k must have same non-feature dims"
+        assert v.shape[:-1] == k.shape[:-1], "k and v must have same non-feature dims"
+        assert k.shape[-1] == v.shape[-1] == D, "Feature dim mismatch"
+
+        # Move axial dim to -2 for all tensors
+        q_t = q.transpose(dim, -2).contiguous()  # (B, ..., Tq, D)
+        k_t = k.transpose(dim, -2).contiguous()  # (B, ..., Tk, D)
+        v_t = v.transpose(dim, -2).contiguous()  # (B, ..., Tk, D)
+
+        # Flatten all non-(T, D) dims into batch
+        B_star = int(q_t.numel() // (Tq * D))
+        q_flat = q_t.view(B_star, Tq, D)
+        k_flat = k_t.view(B_star, Tk, D)
+        v_flat = v_t.view(B_star, Tk, D)
+
+        # Handle mask: expected to index (Tq, Tk)
+        mask_flat = None
         if mask is not None:
-            assert mask.shape[-2] == q.shape[dim] and mask.shape[-1] == k.shape[dim], "Mask shape does not match the attention dimensions."
-            if mask.dim() ==2:
-                mask = mask.unsqueeze(0)  # 1xTq xTk
-        Y = self.attn(reordered_q, reordered_k, reordered_v, mask) #...xT_dimxD
-        Y = Y.view((dims_q[:dim]+dims_q[dim+1:-1]+[dims_q[dim], D])).transpose(dim, -2).contiguous() # Verifiy if this line is actually needed
+            # Allowed shapes:
+            # - (Tq, Tk)
+            # - (1, Tq, Tk)
+            # - (B, Tq, Tk) matching original batch
+            # - (B, 1, Tq, Tk) matching original batch
+            if mask.dim() == 2:
+                assert mask.shape == (Tq, Tk)
+                mask_flat = mask.unsqueeze(0)  # (1, Tq, Tk)
+            elif mask.dim() == 3:
+                assert mask.shape[-2:] == (Tq, Tk)
+                # Assume first dim is original batch; broadcast along other spatial dims
+                # Flatten along same non-(T, D) dims as q_t
+                # Here we require that only batch is present: (B, Tq, Tk)
+                assert mask.shape[0] == dims_q[0], "3D mask must be (B, Tq, Tk)"
+                mask_flat = mask.repeat_interleave(
+                    int(B_star // dims_q[0]), dim=0
+                )  # (B*, Tq, Tk)
+            elif mask.dim() == 4:
+                assert mask.shape[-2:] == (Tq, Tk)
+                # (B, 1, Tq, Tk) or (B, H, Tq, Tk); we ignore head dim and flatten batch
+                B_mask = mask.shape[0]
+                assert B_mask == dims_q[0], "4D mask batch must match q batch"
+                # Collapse any head dim into batch
+                mask_flat = mask.view(B_mask, -1, Tq, Tk)
+                B_star_mask = mask_flat.shape[0] * mask_flat.shape[1]
+                assert B_star_mask == B_star, "Flattened mask batch must match q_flat batch"
+                mask_flat = mask_flat.view(B_star, Tq, Tk)
+            else:
+                raise ValueError("Unsupported mask rank for AxialAttention")
+
+        # Call inner attention
+        Y_flat = self.attn(q_flat, k_flat, v_flat, mask_flat)  # (B*, Tq, D)
+
+        # Reshape back to original dims
+        Y_t = Y_flat.view(*q_t.shape)  # (B, d1, ..., d_{dim-1}, d_{dim+1}, ..., dN, Tq, D)
+        Y = Y_t.transpose(dim, -2).contiguous()  # (B, d1, ..., dN, D)
         return Y
 
-class FeedForwardBlock(nn.Module):
-    """
-    Feed-Forward block with residual connection and RMSNorm.
-    Uses SwiGLU nonlinearity.
-    """
-    def __init__(self, model_dim, dropout_prob=0.1):
-        super().__init__()
-        self.model_dim = model_dim
-        self.swiglu = SwiGLU(model_dim, model_dim*4)  # or hidden_dim
-        self.Dense2 = nn.Linear(model_dim*4, model_dim)
-        self.dropout = nn.Dropout(dropout_prob)
+# class FeedForwardBlock(nn.Module):
+#     """
+#     Feed-Forward block with residual connection and RMSNorm.
+#     Uses SwiGLU nonlinearity.
+#     """
+#     def __init__(self, model_dim, dropout_prob=0.1):
+#         super().__init__()
+#         self.model_dim = model_dim
+#         self.swiglu = SwiGLU(model_dim, model_dim*4)  # or hidden_dim
+#         self.Dense2 = nn.Linear(model_dim*4, model_dim)
+#         self.dropout = nn.Dropout(dropout_prob)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.Dense2(self.swiglu(x)))
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         return self.dropout(self.Dense2(self.swiglu(x)))
 
 class LayerType(Enum):
     SPATIAL = "spatial"

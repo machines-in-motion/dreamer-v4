@@ -92,28 +92,30 @@ class ForwardDiffusionWithShortcut(nn.Module):
         self.K_max = 2**self.max_pow2
         self.d_min = 1./self.K_max
 
-    def sample_step_noise(self, batch_size, seq_len):
+    def sample_step_noise(self, batch_size, seq_len, device):
         step_idx = torch.randint(0, int(self.max_pow2+1), (batch_size, seq_len))
         # half_step_idx = step_idx+1
         step = 1/2**step_idx
         # half_step = step/2 
-        noise_idx = torch.floor(torch.rand(*step.shape)*(step_idx**2).to(torch.float32))
+        noise_idx = torch.floor(torch.rand(*step.shape)*(step_idx**2).to(torch.float32))# <- Verify 
         # noise_plus_halfstep_idx = noise_idx+half_step/self.d_min
         noise = noise_idx*step
         # noise_plus_halfstep = noise_plus_halfstep_idx*self.d_min
-        return dict(d=step, d_discrete=step_idx, tau=noise, tau_discrite=noise_idx)
+        return dict(d=step.to(device), d_discrete=step_idx.to(device), tau=noise.to(device), tau_discrite=noise_idx.to(device))
     
     def forward(self, x):
         B, T, _, _ = x.shape
-        x0 = torch.randn_like(x)
-        diff_params = self.sample_step_noise(B, T) # BxT, BxT
+        x0 = torch.randn_like(x).to(x.device)
+        diff_params = self.sample_step_noise(B, T, x.device) # BxT, BxT
         tau = diff_params['tau']
         tau = tau.unsqueeze(-1).unsqueeze(-1)
         x_tau = (1.-tau)*x0 + tau*x
-        d_disc = torch.log2(diff_params['d']/df.d_min)
-        tau_disc = (diff_params['tau'])/df.d_min
+
+        # The following converstions are not right
+        d_disc = torch.log2(diff_params['d']/self.d_min)
+        tau_disc = (diff_params['tau'])/self.d_min
         half_d_disc = d_disc+1
-        tau_plus_half_step_disc = (diff_params['tau']+diff_params['d']/2)/df.d_min
+        tau_plus_half_step_disc = (diff_params['tau']+diff_params['d']/2)/self.d_min
         # shortcut_mask = diff_params['d'] > self.d_min
         # no_shortcut_mask = diff_params['d'] == self.d_min
         # with torch.no_grad():
@@ -131,5 +133,3 @@ class ForwardDiffusionWithShortcut(nn.Module):
                     tau = diff_params['tau'], 
                     step = diff_params['d']
                     )
-      
-df = ForwardDiffusionWithShortcut(K_max=16)

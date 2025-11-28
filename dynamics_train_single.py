@@ -1,340 +1,199 @@
+import os
 import time
-from PIL import Image
-import hydra
-from tqdm import tqdm
-from omegaconf import DictConfig, OmegaConf
 import torch
+import hydra
 import torch.nn as nn
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.utils.data import ConcatDataset
-import kornia.augmentation as K
-from dataset import SingleViewSequenceDataset
-from model.tokenizer import (CausalTokenizerDecoder, 
-                             CausalTokenizerEncoder, 
-                             CausalTokenizerConfig, 
-                             TokensToImageHead, 
-                             ImagePatchifier)
-from model.utils import TokenMasker
-import torch.optim as optim
-import lpips
-from pathlib import Path
-import wandb
-from transformers import get_cosine_schedule_with_warmup
+from omegaconf import DictConfig, OmegaConf
 
-class RMSLossScaler:
+
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
+from functools import partial
+import torch.distributed as dist
+
+
+from model.dynamics import (DreamerV4Denoiser,
+                            DreamerV4DenoiserCfg,
+                            ForwardDiffusionWithShortcut)
+
+from dataset import ShardedHDF5Dataset
+
+
+def load_checkpoint(
+    ckpt_path: str,
+    model: nn.Module,
+    optim: torch.optim.Optimizer,
+    scheduler,
+    rank: int,
+    device: torch.device,
+):
     """
-    Tracks running RMS for named losses and returns normalized losses.
+    Load FULL checkpoint saved by save_checkpoint().
+    Returns (start_epoch, global_update, wandb_run_id, log_dir).
     """
-    def __init__(self, decay: float = 0.99, eps: float = 1e-8):
-        self.decay = decay
-        self.eps = eps
-        self.ema_sq = {}  # name -> scalar tensor
+    if not os.path.isfile(ckpt_path):
+        if rank == 0:
+            print(f"No checkpoint found at {ckpt_path}, starting from scratch.")
+        return 0, 0, None, None  # epoch, global_update, wandb_run_id, log_dir
 
-    def __call__(self, name: str, value: torch.Tensor) -> torch.Tensor:
-        # value is a scalar loss tensor (per-batch, per-rank)
-        with torch.no_grad():
-            sq = value.detach().pow(2)
-            mean_sq = sq.mean()
+    # Rank 0 loads from disk
+    if rank == 0:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        print(f"[rank0] Loaded checkpoint from {ckpt_path}")
+    else:
+        ckpt = None
 
-            if name not in self.ema_sq:
-                self.ema_sq[name] = mean_sq
-            else:
-                self.ema_sq[name] = (
-                    self.decay * self.ema_sq[name] + (1.0 - self.decay) * mean_sq
-                )
+    # Broadcast checkpoint to all ranks
+    obj_list = [ckpt]
+    dist.broadcast_object_list(obj_list, src=0)
+    ckpt = obj_list[0]
 
-            rms = (self.ema_sq[name] + self.eps).sqrt()
+    start_epoch = ckpt.get("epoch", 0)
+    global_update = ckpt.get("global_update", 0)
+    wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
+    log_dir = ckpt.get("log_dir", None)            # NEW
+    # DDP: load into wrapped model
+    state_dict = ckpt["model"]
 
-        # Normalize current loss by running RMS; gradient flows only through value
-        return value / rms
+    if isinstance(model, DDP):
+        model.module.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
 
-def save_checkpoint(model, optimizer, step, epoch, cfg, scaler=None, scheduler=None):
-    ckpt_dir = Path(cfg.output_dir) / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"checkpoint_step_{step:07d}.pt"
+    optim.load_state_dict(ckpt["optim"])
+    scheduler.load_state_dict(ckpt["scheduler"])
 
-    # Fix: Access _orig_mod for compiled models
-    model_state = model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
+    if rank == 0:
+        print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}")
+        if wandb_run_id:
+            print(f"Resuming W&B run ID: {wandb_run_id}")
+        if log_dir:
+            print(f"Resuming log directory: {log_dir}")
 
-    checkpoint = {
-        "model": model_state,  # ← CHANGED
-        "optimizer": optimizer.state_dict(),
-        "step": step,
-        "epoch": epoch,
-        "cfg": OmegaConf.to_container(cfg, resolve=True),
-    }
+    return start_epoch, global_update, wandb_run_id, log_dir
 
-    if scaler is not None:
-        checkpoint["scaler"] = scaler.state_dict()
-
-    if scheduler is not None:
-        checkpoint["scheduler"] = scheduler.state_dict()
-
-    torch.save(checkpoint, ckpt_path)
-    print(f"🔒 Checkpoint saved at: {str(ckpt_path)}")
-
-def load_checkpoint(ckpt_path, model, optimizer=None, scaler=None, scheduler=None):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-
-    model.load_state_dict(ckpt["model"])
-
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-
-    if scaler is not None and "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
-
-    if scheduler is not None and "scheduler" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler"])
-
-    step = ckpt.get("step", 0)
-    epoch = ckpt.get("epoch", 0)
-
-    print(f"🔄 Loaded checkpoint from {ckpt_path} at step={step}, epoch={epoch}")
-    return step, epoch
-
-class ModelWrapper(nn.Module):
-    def __init__(self, cfg:DictConfig):
-        super().__init__()
-        self.cfg = cfg
-        tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer)) 
-        self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
-        self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
-        self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
-        self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
-        self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
-
-    def forward(self, images):
-        images = (images*2.)-1. # Translate the images in +-1 range
-        tokens = self.patchifier(images)
-        masked_tokens = self.masker(tokens)
-        z, _ = self.encoder(masked_tokens)
-        z_decoded = self.decoder(z)
-        recon_images = self.image_head(z_decoded)
-        return  torch.clamp((recon_images + 1)/2., 0., 1.)
-
-@hydra.main(config_path="config", config_name="tokenizer_small.yaml")
-def main(cfg: DictConfig):
-    # --------------------------------------------------------------------
-    #  W&B SETUP
-    # --------------------------------------------------------------------
-    # wandb.init(project="dreamerv4-tokenizer")
-    if cfg.wandb.enable:
-        if cfg.wandb.api_key:
-            wandb.login(key=cfg.wandb.api_key)
-        else:
-            wandb.login()   # rely on env var or already logged-in session
-        wandb_config = OmegaConf.to_container(cfg, resolve=True)
-        wandb.init(
-            project=cfg.wandb.project,
-            entity="rk4342",
-            config=wandb_config
-        )
-    # Torch configs
-    if cfg.train.enable_fast_matmul:
-        torch.set_float32_matmul_precision('high')
-    device = cfg.train.device
-
-    # Dataset and data loaders
-    dataset_base_path = Path(cfg.dataset.base_path)
-    train_datasets = [SingleViewSequenceDataset(dataset_base_path/seq_file, cfg.tokenizer.max_context_length, load_to_ram=cfg.dataset.load_to_ram)
-            for seq_file in cfg.dataset.train_sequences]
-    train_dataset = ConcatDataset(train_datasets)
-
-    test_datasets = [SingleViewSequenceDataset(dataset_base_path/seq_file, cfg.tokenizer.max_context_length, load_to_ram=cfg.dataset.load_to_ram)
-            for seq_file in cfg.dataset.test_sequences]
-    test_dataset = ConcatDataset(test_datasets)
+def setup_distributed():
+    """
+    Initialize distributed process group using SLURM environment variables.
+    SLURM sets these automatically when using srun with --ntasks-per-node.
+    """
+    # SLURM sets these environment variables automatically
+    rank = int(os.environ['SLURM_PROCID'])           # Global rank
+    local_rank = int(os.environ['SLURM_LOCALID'])    # Local rank on node
+    world_size = int(os.environ['SLURM_NTASKS'])     # Total number of tasks
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.train.batch_size,
-        num_workers=cfg.train.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        shuffle=True,
+    # Set device for this process
+    torch.cuda.set_device(local_rank)
+
+    # Initialize process group with NCCL backend
+    # MASTER_ADDR and MASTER_PORT should be set in SLURM script
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=world_size,
+        rank=rank
+    )
+    
+    return rank, local_rank, world_size
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def create_distributed_dataloader(
+    dataset: str,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    num_workers: int = 4,
+    seed: int = 42,
+    shuffle: bool = True,
+    drop_last: bool = True,
+):
+    """
+    Create DataLoader with DistributedSampler for sharded HDF5 dataset.
+    """
+
+    # Create DistributedSampler
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=shuffle,
+        seed=seed,
+        drop_last=drop_last,
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=cfg.train.batch_size,
-        num_workers=cfg.train.num_workers,
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        shuffle=True,
+        drop_last=drop_last,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
-    test_iter = iter(test_loader)
-    if cfg.augmentation.enable:
-        augmentor = torch.nn.Sequential(
-            K.RandomGaussianBlur(tuple(cfg.augmentation.gaussian_blur.kernel_size),
-                                 tuple(cfg.augmentation.gaussian_blur.sigma_range), 
-                                 p=cfg.augmentation.gaussian_blur.application_probability),
-            
-            K.ColorJitter(brightness=cfg.augmentation.color_jitter.brightness, 
-                          contrast=  cfg.augmentation.color_jitter.contrast, 
-                          saturation=cfg.augmentation.color_jitter.saturation,
-                          hue=cfg.augmentation.color_jitter.hue,
-                          p=cfg.augmentation.color_jitter.application_probability),
-            
-            K.RandomGaussianNoise(mean=cfg.augmentation.random_noise.mean, 
-                                  std=cfg.augmentation.random_noise.std)
-        )
 
-    # Instantiate the model
-    model = ModelWrapper(cfg)
-    model.to(device)
-    # print('Compiling the model...')
-    model = torch.compile(model, mode=cfg.train.torch_compile_mode)
-    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    return dataloader
 
-    num_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-    print(f"Number of encoder parameters (M): {num_params/1e6:.2f}M")
-    num_params = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
-    print(f"Number of decoder parameters (M): {num_params/1e6:.2f}M")
+
+rank, local_rank, world_size = setup_distributed()
+
+@hydra.main(config_path='config', config_name='dynamics_small.yaml')
+def main(cfg: DictConfig):
+
+    train_dataset = ShardedHDF5Dataset(
+                                data_dir=cfg.dataset.base_path,
+                                window_size=cfg.train.long_context,
+                                stride=1,
+                                split="train",
+                                train_fraction=0.9,
+                                split_seed=123)
+    dev_dataset = ShardedHDF5Dataset(
+                                data_dir=cfg.dataset.base_path,
+                                window_size=cfg.train.long_context,
+                                stride=1,
+                                split="test",
+                                train_fraction=0.9,
+                                split_seed=123)
+    
+    train_loader = create_distributed_dataloader(train_dataset, cfg.train.batch_size, local_rank, world_size, cfg.train.num_workers)
+    dev_loader = create_distributed_dataloader(dev_dataset, cfg.train.batch_size, local_rank, world_size, cfg.train.num_workers)
+    
+
+
+    model = DreamerV4Denoiser(DreamerV4DenoiserCfg(**OmegaConf.to_object(cfg.denoiser)))
+    model.cuda(local_rank)
+
+    n_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
+    diffuser = ForwardDiffusionWithShortcut(cfg.denoiser.K_max)
+    print(f'The number of denoiser parameters is: {n_params/1e6:.2f} M')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-    
-    N_steps = cfg.train.num_epochs*len(train_loader)
-    WARMUP_STEPS = N_steps * 0.02
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=WARMUP_STEPS,
-        num_training_steps=N_steps,
-        num_cycles=0.5
-    )
-    # RMS loss normalizer for tokenizer losses
-    rms_norm = RMSLossScaler(decay=0.99, eps=1e-8)
-    mse_loss_fn = nn.MSELoss()
-    lpips_model = lpips.LPIPS(net='vgg').to(device=device, dtype=torch.bfloat16)
-    lpips_model.eval()
-    for p in lpips_model.parameters():
-        p.requires_grad_(False)
 
     step = 0
-    print('Training started:')
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
-            step += 1
-            # ctx_len = torch.randint(1, cfg.tokenizer.max_context_length,(1,)).item()
-            ctx_len = -1
-            imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
-            if cfg.augmentation.enable:
-                B, T, C, H, W = imgs.shape
-                imgs = imgs.view(B*T, C, H, W).contiguous().to(device)      # flatten time
-                imgs = augmentor(imgs) 
-                imgs = imgs.view(B, T, C, H, W).to(torch.float32)     # restore shape
-            
-            torch.compiler.cudagraph_mark_step_begin()
-            optimizer.zero_grad()
-            model.train()
-
-            if cfg.train.mixed_precision:           
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    recon_images = model(imgs)
-                    mse = mse_loss_fn(recon_images, imgs)
-            else:
-                recon_images = model(imgs)
-                mse = mse_loss_fn(recon_images, imgs)
-
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    images_lpips = (imgs * 2.0) - 1.0        
-                    x_hat_lpips = (recon_images * 2.0) - 1.0
-                    B, T, C, H, W = images_lpips.shape
-                    images_lpips_flat = images_lpips.view(B * T, C, H, W)
-                    x_hat_lpips_flat = x_hat_lpips.view(B * T, C, H, W)
-                    lpips_val = lpips_model(x_hat_lpips_flat, images_lpips_flat)
-                    lpips_loss = lpips_val.mean()
-
-            raw_loss = mse + 0.2 * lpips_loss
-            mse_norm = rms_norm("mse", mse)
-            lpips_norm = rms_norm("lpips", lpips_loss)
-            loss = (mse_norm + 0.2 * lpips_norm)
-            loss.backward()
-            
-            if cfg.train.clip_grad_norm:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip_grad_norm)
-
-            optimizer.step()
-            scheduler.step()
-            if step % cfg.print_every==0:
-                print(f"RMSE Loss: {loss.item()}, Raw_Loss: {raw_loss.item()}")
-                # wandb.log({
-                #     "epoch": epoch,
-                #     "training_loss": total_loss,
-                #     "lr": optimizer.param_groups[0]['lr'],
-                #     # "best loss": best_loss
-                # })
-
-            # ------------------------------------------------------------------
-            #  LOG LOSS TO WANDB
-            # ------------------------------------------------------------------
-            if cfg.wandb.enable and (step % cfg.train.log_every == 0):
-                wandb.log({
-                    "train/mse_loss": mse.item(),
-                }, step=step)
+            step +=1
+            B, T, _, _, _ = batch['image'].shape
+            fake_tokens = torch.randn(B, T, cfg.denoiser.num_latent_tokens, cfg.denoiser.latent_dim).cuda(local_rank).to(torch.float32)
+            diffused_batch = diffuser(fake_tokens)
+            tau_d = diffused_batch['tau_d']
+            step_d = diffused_batch['step_d']
+            x_tau = diffused_batch['x_tau']
+            breakpoint()
+            denoising_vel = model(x_tau, tau_d, step_d)
 
 
-            if step % cfg.plot_every == 0:
-                # ------------------------------------------------------------------
-                #  EVALUATION STEP ON RANDOM TEST BATCH
-                # ------------------------------------------------------------------
-                model.eval()
-                with torch.no_grad():
-                    # sample a random batch
-                    try:
-                        test_batch = next(test_iter)
-                    except:
-                        test_iter = iter(test_loader)
-                        test_batch = next(test_iter)
+    breakpoint()
+    
 
-                    test_imgs = test_batch['observation.image'].to(torch.float32).to(device)#[:,:16,...]
-                    B, T, C, H, W = test_imgs.shape
-
-                    recon = model(test_imgs)               # (B, T, C, H, W)
-                    recon = recon.clamp(0.0, 1.0)
-
-                    # --------------------------------------------------------------
-                    #  BUILD TILE: odd rows = recon, even rows = GT
-                    #  Tile size: (2B rows, T columns)
-                    # --------------------------------------------------------------
-                    rows = []
-                    for b in range(B):
-                        row_recon = torch.cat([recon[b, t] for t in range(T)], dim=2)  # concat along width
-                        row_gt    = torch.cat([test_imgs[b, t] for t in range(T)], dim=2)
-                        rows.append(row_recon)
-                        rows.append(row_gt)
-                    tiled = torch.cat(rows, dim=1)   # stack vertically
-
-                    # --------------------------------------------------------------
-                    #  Convert to PIL Image
-                    # --------------------------------------------------------------
-                    tiled_np = (tiled.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
-
-                    tiled_img = Image.fromarray(tiled_np)
-
-                    # --------------------------------------------------------------
-                    #  Resize to a W&B-friendly size (max 512px)
-                    # --------------------------------------------------------------
-                    max_dim = 4096
-                    w, h = tiled_img.size
-                    scale = min(max_dim / max(w, h), 1.0)
-                    new_w, new_h = int(w * scale), int(h * scale)
-                    tiled_img_resized = tiled_img.resize((new_w, new_h), Image.BILINEAR)
-
-                    # --------------------------------------------------------------
-                    #  Save image locally
-                    # --------------------------------------------------------------
-                    output_dir = Path(cfg.output_dir) / "plots"
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    file_path = output_dir / f"step_{step:06d}.png"
-                    tiled_img_resized.save(file_path)
-
-                    # --------------------------------------------------------------
-                    #  Optional W&B logging
-                    # --------------------------------------------------------------
-                    if cfg.wandb.enable:
-                        wandb.log({"reconstruction_preview": wandb.Image(tiled_img_resized)}, step=step)
-        save_checkpoint(model, optimizer, step, epoch, cfg)
-
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
+    cleanup_distributed()
+    
