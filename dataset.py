@@ -160,6 +160,16 @@ class SingleViewSequenceDataset(Dataset):
         }
         return Dout
     
+    def close(self):
+        if self.load_to_ram:
+            return
+        if self._h5 is not None:
+            try:
+                self._h5.close()
+            except:
+                pass
+            self._h5 = None
+    
 class ShardedHDF5Dataset(Dataset):
     """
     Dataset for sharded HDF5 files optimized for multi-node training.
