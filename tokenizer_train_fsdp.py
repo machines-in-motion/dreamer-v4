@@ -44,7 +44,7 @@ class ModelWrapper(nn.Module):
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
         self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
-        self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
+        self.masker = TokenMasker(cfg.tokenizer.model_dim)
 
     def forward(self, images):
         images = (images*2.)-1. # Translate the images in +-1 range
@@ -53,7 +53,8 @@ class ModelWrapper(nn.Module):
         z, _ = self.encoder(masked_tokens)
         z_decoded = self.decoder(z)
         recon_images = self.image_head(z_decoded)
-        return  torch.clamp((recon_images + 1)/2., 0., 1.)
+        # return  torch.clamp((recon_images + 1)/2., 0., 1.)
+        return (recon_images + 1)/2.
 
 class RMSLossScaler:
     """
@@ -321,7 +322,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-@hydra.main(config_path="config", config_name="tokenizer.yaml")
+@hydra.main(config_path="config", config_name="tokenizer_cfg2.yaml")
 def main(cfg: DictConfig):
     # Setup distributed training
     rank, local_rank, world_size = setup_distributed()
@@ -369,9 +370,9 @@ def main(cfg: DictConfig):
     CONTEXT_T = 96
     N_LATENTS = 512
     BOTTLENECK_D = 16
-    D_MODEL = 768
-    N_LAYERS = 12
-    HEADS_Q = 12
+    D_MODEL = 1024
+    N_LAYERS = 16
+    HEADS_Q = 16
     HEADS_KV_LATENT = 16
     MLP_RATIO = 4.0
     TEMPORAL_EVERY = 4
@@ -836,7 +837,7 @@ def main(cfg: DictConfig):
             print(f"{'='*60}\n")
 
         save_checkpoint(
-            ckpt_path=ckpt_path,
+            ckpt_path=f"/scratch/rk4342/dreamer-v4/fsdp_logs/{epoch}.pt",
             epoch=epoch,
             global_update=global_update,
             model = model,

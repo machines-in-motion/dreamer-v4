@@ -102,7 +102,7 @@ class ModelWrapper(nn.Module):
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
         self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
-        self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
+        self.masker = TokenMasker(cfg.tokenizer.model_dim)
 
     def forward(self, images):
         images = (images*2.)-1. # Translate the images in +-1 range

@@ -1,11 +1,11 @@
 defaults:
- - dataset: pushT
+ - dataset: tmp
 
 reload_checkpoint: null
 output_dir: /scratch/rk4342/dreamer-v4/tokenizer_ckpts/${now:%Y-%m-%d_%H-%M-%S}
-plot_every: 250
-print_every: 20
-log_every: 10
+plot_every: 1000
+print_every: 100
+log_every: 25
 
 augmentation:
   enable: false
@@ -29,8 +29,8 @@ augmentation:
 tokenizer:
   num_modality_tokens: 256    # Number of tokens for the image or other modalities
   num_latent_tokens: 512      # The number of latent tokens per frame
-  max_context_length: 32      # The maximum temporal horizon of the tokenizer
-  model_dim: 512              # The dimension of the transformer latents
+  max_context_length: 96      # The maximum temporal horizon of the tokenizer
+  model_dim: 1024              # The dimension of the transformer latents
   latent_dim: 16              # The dimention of the encoder output latents (z)
   enc_num_layers: 4           # Causal tokenizer encoder depth
   dec_num_layers: 4           # Causal tokenizer decoder depth
@@ -38,20 +38,34 @@ tokenizer:
   n_kv_heads: 16
   dropout_prob: 0.1
   qk_norm: true
-  patch_size: 8
+  patch_size: 16
+
+# tokenizer:
+#   num_modality_tokens: 256    # Number of tokens for the image or other modalities
+#   num_latent_tokens: 512      # The number of latent tokens per frame
+#   max_context_length: 48      # The maximum temporal horizon of the tokenizer
+#   model_dim: 384              # The dimension of the transformer latents
+#   latent_dim: 16              # The dimention of the encoder output latents (z)
+#   enc_num_layers: 4           # Causal tokenizer encoder depth
+#   dec_num_layers: 4           # Causal tokenizer decoder depth
+#   n_heads: 8
+#   n_kv_heads: 8
+#   dropout_prob: 0.1
+#   qk_norm: true
+#   patch_size: 8
 
 train:
   device: 'cuda:0'
-  num_epochs: 50
+  num_epochs: 100
   batch_size: 4
   accum_grad_steps: 1
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2
   num_training_steps: 1e7
-  mixed_precision: true
+  mixed_precision: false
   torch_compile_mode: "default"
-  enable_flash_attention: true
+  enable_flash_attention: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
 
@@ -59,4 +73,3 @@ wandb:
   enable: false 
   api_key: null
   project: "dreamerv4-tokenizer" # Replace with your wandb project name
-

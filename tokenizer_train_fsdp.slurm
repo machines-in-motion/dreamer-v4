@@ -7,13 +7,13 @@
 #SBATCH --cpus-per-task=16                 # CPU cores per GPU
 #SBATCH --mem=0                            # Request all memory on node
 #SBATCH --time=48:00:00                    # Max runtime
-#SBATCH --output=logs/dreamer_%j.out       # Output log
-#SBATCH --error=logs/dreamer_%j.err        # Error log
+#SBATCH --output=logs_fsdp/dreamer_%j.out       # Output log
+#SBATCH --error=logs_fsdp/dreamer_%j.err        # Error log
 #SBATCH --account torch_pr_43_tandon_advanced
 #SBATCH --exclusive
 
 # Create logs directory
-mkdir -p logs
+mkdir -p logs_fsdp
 
 # Get master node address for distributed training
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
