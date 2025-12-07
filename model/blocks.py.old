@@ -63,22 +63,19 @@ class RopeEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
+        # Cache the sin/cos computations to avoid recomputation
         thetas = torch.tensor([10000**(-2*i/dim) for i in range(dim//2)])
         thetas = torch.stack([thetas, thetas], dim=0).transpose(0,1).reshape(-1)
-        # Pre-compute full table
         thetas_all = torch.stack([thetas*i for i in range(max_seq_len)], dim=0)
         cos_cache = thetas_all.cos() # TxD
         sin_cache = thetas_all.sin() # TxD
         self.register_buffer('cos_emb', cos_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
         self.register_buffer('sin_emb', sin_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k:torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor] :
         B, H, T, d = q.shape
-        
-        # Slice with offset for inference
-        cos_emb = self.cos_emb[:, :, offset : offset + T, :]
-        sin_emb = self.sin_emb[:, :, offset : offset + T, :]
-        
+        cos_emb = self.cos_emb[:, :, :T, :]  # 1x1xTxD
+        sin_emb = self.sin_emb[:, :, :T, :]  # 1x1xTxD 
         q_odd, q_even = q[..., ::2], q[..., 1::2]
         qJ = torch.stack([-q_even, q_odd], dim=-1).reshape_as(q)
         k_odd, k_even = k[..., ::2], k[..., 1::2]
@@ -88,41 +85,11 @@ class RopeEmbedding(nn.Module):
         k_rot = (k * cos_emb) + (kJ * sin_emb)
         return q_rot, k_rot
     
-@dataclass
-class KVCache:
-    k: Optional[torch.Tensor] = None
-    v: Optional[torch.Tensor] = None
-    max_window: int = 32 # The moving horizon size
-
-    def update(self, new_k, new_v):
-        # Concatenate along time dimension (dim=2)
-        if self.k is None:
-            self.k = new_k
-            self.v = new_v
-        else:
-            self.k = torch.cat([self.k, new_k], dim=2)
-            self.v = torch.cat([self.v, new_v], dim=2)
-        
-        # Enforce Moving Horizon
-        if self.k.shape[2] > self.max_window:
-            self.k = self.k[:, :, -self.max_window:, :]
-            self.v = self.v[:, :, -self.max_window:, :]
-        return self.k, self.v
-    
-    def get_view(self, new_k, new_v):
-        """
-        Returns combined K/V for attention computation WITHOUT updating the permanent cache.
-        Used during the intermediate diffusion steps.
-        """
-        if self.k is None:
-            return new_k, new_v
-        return torch.cat([self.k, new_k], dim=2), torch.cat([self.v, new_v], dim=2)
-
 class Attention(nn.Module):
     """
     Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
     """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=False):
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=False):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
@@ -132,6 +99,7 @@ class Attention(nn.Module):
         self.dropout_prob = dropout_prob
         self.rope_embedder = rope_embedder
         self.qk_norm = qk_norm
+        self.causal = causal
         self.flash_attention = flash_attention
         self.W_q = nn.Linear(self.d, self.d, bias=False)
         self.W_k = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
@@ -144,9 +112,7 @@ class Attention(nn.Module):
                  q: torch.Tensor,
                  k: torch.Tensor,
                  v: torch.Tensor,
-                 mask: Optional[torch.Tensor] = None,
-                 causal: Optional[bool] = False,
-                 kv_cache: Optional[KVCache] = None)-> Tuple[torch.Tensor, torch.Tensor]:
+                 mask: Optional[torch.Tensor] = None)-> Tuple[torch.Tensor, torch.Tensor]:
         """
         Multi-head (self/cross) attention forward pass.
         Args:
@@ -175,19 +141,8 @@ class Attention(nn.Module):
             K = F.normalize(K, dim=-1)
             Q = self.g*Q
 
-        # Handle RoPE and Caching
-        if kv_cache is not None:
-            # 1. Determine offset based on what is already in cache
-            current_cache_len = kv_cache.k.shape[2] if kv_cache.k is not None else 0
-            
-            # 2. Apply RoPE to the NEW keys/queries with the correct absolute position offset
-            if self.rope_embedder is not None:
-                Q, K = self.rope_embedder(Q, K, offset=current_cache_len)
-            # 3. Update Cache (concatenates and slices window)
-            K, V = kv_cache.update(K, V)
-        else:
-            if self.rope_embedder is not None:
-                Q, K = self.rope_embedder(Q, K)
+        if self.rope_embedder is not None:
+            Q, K = self.rope_embedder(Q, K)
         
         if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -195,7 +150,7 @@ class Attention(nn.Module):
                     Q, K, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
-                    is_causal=causal,
+                    is_causal=self.causal,
                     scale = None,
                     enable_gqa= False if self.n_kv_heads == self.n_heads else True,
                 )  # [B, n_heads, Tq, dk]
@@ -204,7 +159,7 @@ class Attention(nn.Module):
                     Q, K, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
-                    is_causal=causal,
+                    is_causal=self.causal,
                     scale = None,
                     enable_gqa= False if self.n_kv_heads == self.n_heads else True,
                 )  # [B, n_heads, Tq, dk]
@@ -229,8 +184,6 @@ class AxialAttention(nn.Module):
         v: torch.Tensor,
         dim: int,
         mask: Optional[torch.Tensor] = None,
-        causal: Optional[bool] = False,
-        kv_cache: Optional[KVCache] = None,
     ):
         # q: (B, d1, ..., dN, D)
         dims_q = list(q.shape)
@@ -289,7 +242,7 @@ class AxialAttention(nn.Module):
                 raise ValueError("Unsupported mask rank for AxialAttention")
 
         # Call inner attention
-        Y_flat = self.attn(q_flat, k_flat, v_flat, mask_flat, causal=causal, kv_cache=kv_cache)  # (B*, Tq, D)
+        Y_flat = self.attn(q_flat, k_flat, v_flat, mask_flat)  # (B*, Tq, D)
 
         # Reshape back to original dims
         Y_t = Y_flat.view(*q_t.shape)  # (B, d1, ..., d_{dim-1}, d_{dim+1}, ..., dN, Tq, D)
@@ -333,6 +286,7 @@ class EfficientTransformerLayer(nn.Module):
                 model_dim=model_dim,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
+                causal=False,
                 dropout_prob=dropout_prob,
                 qk_norm=qk_norm,
                 max_seq_len=max_seq_len,
@@ -346,20 +300,22 @@ class EfficientTransformerLayer(nn.Module):
         self.ffn = FeedForwardSwiGLU(model_dim, None, dropout_prob)
         self.dropout = nn.Dropout(dropout_prob)
 
-    def forward(self, 
-                x, 
-                temporal_mask=None, 
-                spatial_mask=None,
-                layer_cache: Optional[KVCache] = None):
+    def forward(self, x, temporal_mask=None, spatial_mask=None):
         """
         x: (B, T, S, D)
         """
+
+        # pick dimension and mask
+        if self.layer_type == LayerType.SPATIAL:
+            attn_dim = 2
+            mask = spatial_mask
+        else:
+            attn_dim = 1
+            mask = temporal_mask
+
         # Attention block
         h = self.norm1(x)
-        if self.layer_type == LayerType.TEMPORAL:
-            h = self.attn(h, h, h, dim=1, causal=True, kv_cache = layer_cache)
-        else:
-            h = self.attn(h, h, h, dim=2, mask=spatial_mask) # Spatial dimention has no cacheing
+        h = self.attn(h, h, h, dim=attn_dim, mask=mask)
         x = x + self.dropout(h)
 
         # FFN block
@@ -415,16 +371,14 @@ class EfficientTransformerBlock(nn.Module):
 
         self.model_dim = model_dim
 
-    def forward(self, x, temporal_mask=None, spatial_mask=None, block_caches: Optional[List[KVCache]]=None):
+    def forward(self, x, temporal_mask=None, spatial_mask=None):
         assert x.size(-1) == self.model_dim
-        if block_caches is None:
-            block_caches = [None] * len(self.layers)
-        for i, layer in enumerate(self.layers):
+
+        for layer in self.layers:
             x = layer(
                 x,
                 temporal_mask=temporal_mask,
                 spatial_mask=spatial_mask,
-                layer_cache=block_caches[i],
             )
 
         return x
