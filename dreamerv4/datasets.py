@@ -1,14 +1,11 @@
 import h5py
 import torch
-from torch.utils.data import Dataset
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DistributedSampler
-import h5py
+import json
 import numpy as np
 from pathlib import Path
-import json
+from torch.utils.data import Dataset
 
+# To be depricated
 class SingleViewSequenceDataset(Dataset):
     """
     Fast dataset for a single HDF5 sequence.
@@ -311,3 +308,294 @@ class ShardedHDF5Dataset(Dataset):
         }
         
         return stats
+
+class HDF5SequenceDataset(Dataset):
+    """
+    Dataset that creates sliding windows from a directory of independent .h5 files.
+    It automatically parses 'dones' to ensure windows do not cross episode boundaries.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        window_size: int,
+        stride: int = 1,
+    ):
+        """
+        Args:
+            data_dir: Directory containing .h5 files.
+            window_size: Sequence length (batch time dimension).
+            stride: Step size between windows.
+        """
+        self.data_dir = Path(data_dir)
+        self.window_size = window_size
+        self.stride = stride
+        
+        # Find all H5 files
+        self.h5_files = sorted([
+            f for f in self.data_dir.glob("*.h5") 
+            if "shard" not in f.name # Exclude shard files if mixed
+        ])
+        
+        if not self.h5_files:
+            raise ValueError(f"No .h5 files found in {data_dir}")
+
+        # Indexing structure: list of (file_index, start_frame_index)
+        self.windows = []
+        
+        print(f"Scanning {len(self.h5_files)} files for valid episodes...")
+        
+        total_frames = 0
+        total_episodes = 0
+        
+        for file_idx, file_path in enumerate(self.h5_files):
+            try:
+                with h5py.File(file_path, 'r') as f:
+                    if 'dones' not in f or 'images' not in f:
+                        print(f"Skipping {file_path.name}: missing datasets")
+                        continue
+                        
+                    n_frames = len(f['images'])
+                    dones = f['dones'][:]
+                    
+                    # Identify Episode Boundaries
+                    # An episode ends where done=1.
+                    # We need start and end indices for every continuous segment.
+                    
+                    # Indices where done == 1
+                    done_indices = np.where(dones > 0.5)[0]
+                    
+                    # Episode Starts: [0] + [idx+1 for idx in done_indices if idx+1 < n_frames]
+                    # Episode Ends:   [idx+1 for idx in done_indices] + [n_frames] (if last frame isn't done)
+                    
+                    # Simpler logic: Iterate through done indices to carve out chunks
+                    start_idx = 0
+                    
+                    # Add a synthetic done at the very end to close the last loop
+                    all_boundaries = list(done_indices)
+                    if len(all_boundaries) == 0 or all_boundaries[-1] != n_frames - 1:
+                        all_boundaries.append(n_frames - 1)
+                        
+                    for end_idx in all_boundaries:
+                        # The episode is valid from start_idx to end_idx (inclusive)
+                        # Length = end_idx - start_idx + 1
+                        
+                        # Generate windows for this segment
+                        # Valid starts: range(segment_start, segment_end - window_size + 2, stride)
+                        # Example: Ep len 50, window 50. range(0, 0+1) -> [0]. Window 0:50.
+                        
+                        # Note: HDF5 slicing [start:end] is exclusive at end, so we use end_idx + 1
+                        segment_len = (end_idx - start_idx) + 1
+                        
+                        if segment_len >= self.window_size:
+                            num_windows_in_ep = (segment_len - self.window_size) // self.stride + 1
+                            
+                            for k in range(num_windows_in_ep):
+                                global_start = start_idx + (k * self.stride)
+                                self.windows.append((file_idx, global_start))
+                            
+                            total_episodes += 1
+                        
+                        # Next episode starts after this done
+                        start_idx = end_idx + 1
+                        
+                    total_frames += n_frames
+                    
+            except Exception as e:
+                print(f"Error reading {file_path.name}: {e}")
+
+        print(f"Found {len(self.windows)} windows across {total_episodes} valid episodes.")
+        print(f"Total raw frames processed: {total_frames}")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        file_idx, start_frame = self.windows[idx]
+        file_path = self.h5_files[file_idx]
+        end_frame = start_frame + self.window_size
+
+        with h5py.File(file_path, 'r') as f:
+            images = f['images'][start_frame:end_frame]  # [T, H, W, 3] (BGR)
+            commands = f['commands'][start_frame:end_frame]
+            dones = f['dones'][start_frame:end_frame]
+
+            # --- Handle optional is_demo field ---
+            if 'is_demo' in f:
+                is_demo = f['is_demo'][start_frame:end_frame]
+            else:
+                # Create zeros matching the sequence length
+                is_demo = np.zeros((self.window_size, 1), dtype=np.float32)
+
+        # --- Convert BGR to RGB ---
+        # Numpy array slicing is the fastest way to do this
+        images = images[..., ::-1].copy()
+
+        # Convert to Torch
+        images = torch.from_numpy(images).float() / 255.0
+        images = images.permute(0, 3, 1, 2)  # [T, C, H, W]
+        
+        commands = torch.from_numpy(commands).float()
+        dones = torch.from_numpy(dones).float()
+
+        # Ensure is_demo is a tensor
+        if isinstance(is_demo, np.ndarray):
+            is_demo = torch.from_numpy(is_demo).float()
+
+        return {
+            'image': images,
+            'action': commands,
+            'done': dones,
+            'is_demo': is_demo
+        }
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Analyze ShardedHDF5Dataset and print statistics"
+    )
+    parser.add_argument(
+        '--data_dir',
+        type=str,
+        default='/scratch/ja5009/soar_data_sharded/',
+        help='Path to sharded HDF5 directory'
+    )
+    parser.add_argument(
+        '--window_size',
+        type=int,
+        default=96,
+        help='Window size for sliding windows'
+    )
+    parser.add_argument(
+        '--stride',
+        type=int,
+        default=1,
+        help='Stride for sliding windows'
+    )
+    parser.add_argument(
+        '--show_histogram',
+        action='store_true',
+        help='Show histogram of episode lengths (requires matplotlib)'
+    )
+    
+    args = parser.parse_args()
+    
+    print("="*70)
+    print("ShardedHDF5Dataset Analysis")
+    print("="*70)
+    print(f"\nLoading dataset from: {args.data_dir}")
+    print(f"Window size: {args.window_size}")
+    print(f"Stride: {args.stride}\n")
+    
+    # Create dataset
+    dataset = ShardedHDF5Dataset(
+        data_dir=args.data_dir,
+        window_size=args.window_size,
+        stride=args.stride,
+    )
+    
+    # Get statistics
+    stats = dataset.get_episode_length_statistics()
+    
+    print("\n" + "="*70)
+    print("Episode Length Statistics")
+    print("="*70)
+    print(f"Total Episodes:           {stats['total_episodes']:,}")
+    print(f"Total Timesteps:          {stats['total_timesteps']:,}")
+    print(f"Total Windows:            {len(dataset):,}")
+    print(f"\nLength Statistics:")
+    print(f"  Min:                    {stats['min_length']:.0f} steps")
+    print(f"  Max:                    {stats['max_length']:.0f} steps")
+    print(f"  Mean:                   {stats['mean_length']:.2f} steps")
+    print(f"  Median:                 {stats['median_length']:.2f} steps")
+    print(f"  Std Dev:                {stats['std_length']:.2f} steps")
+    print(f"\nPercentiles:")
+    print(f"  25th percentile:        {stats['percentile_25']:.0f} steps")
+    print(f"  75th percentile:        {stats['percentile_75']:.0f} steps")
+    print(f"  90th percentile:        {stats['percentile_90']:.0f} steps")
+    print(f"  95th percentile:        {stats['percentile_95']:.0f} steps")
+    print(f"  99th percentile:        {stats['percentile_99']:.0f} steps")
+    
+    # Calculate storage efficiency
+    avg_windows_per_episode = len(dataset) / stats['total_episodes']
+    print(f"\nDataset Efficiency:")
+    print(f"  Avg windows per episode: {avg_windows_per_episode:.2f}")
+    print(f"  Window coverage:         {avg_windows_per_episode * args.stride / stats['mean_length'] * 100:.1f}%")
+    
+    # Shard information
+    print(f"\nShard Information:")
+    print(f"  Number of shards:        {dataset.num_shards}")
+    print(f"  Avg episodes per shard:  {stats['total_episodes'] / dataset.num_shards:.1f}")
+    
+    # Calculate approximate memory usage per batch
+    if 'image_shape' in dataset.metadata:
+        img_shape = dataset.metadata['image_shape']
+        bytes_per_window = (
+            args.window_size * img_shape[0] * img_shape[1] * img_shape[2] * 4  # float32
+        )
+        print(f"\nMemory Usage (per window):")
+        print(f"  Image shape:             {img_shape}")
+        print(f"  Bytes per window:        {bytes_per_window / (1024**2):.2f} MB")
+        print(f"  Batch of 5 windows:      {5 * bytes_per_window / (1024**2):.2f} MB")
+    
+    print("\n" + "="*70)
+    
+    # Optional: Show histogram
+    if args.show_histogram:
+        try:
+            import matplotlib.pyplot as plt
+            
+            lengths = np.array(dataset.episode_lengths)
+            
+            plt.figure(figsize=(12, 6))
+            
+            # Histogram
+            plt.subplot(1, 2, 1)
+            plt.hist(lengths, bins=50, edgecolor='black', alpha=0.7)
+            plt.axvline(stats['mean_length'], color='r', linestyle='--', 
+                       label=f"Mean: {stats['mean_length']:.1f}")
+            plt.axvline(stats['median_length'], color='g', linestyle='--', 
+                       label=f"Median: {stats['median_length']:.1f}")
+            plt.xlabel('Episode Length (timesteps)')
+            plt.ylabel('Frequency')
+            plt.title('Episode Length Distribution')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Box plot
+            plt.subplot(1, 2, 2)
+            plt.boxplot(lengths, vert=True)
+            plt.ylabel('Episode Length (timesteps)')
+            plt.title('Episode Length Box Plot')
+            plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Save figure
+            output_file = Path(args.data_dir) / 'episode_length_analysis.png'
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
+            print(f"\nHistogram saved to: {output_file}")
+            
+            plt.show()
+            
+        except ImportError:
+            print("\nWarning: matplotlib not installed. Cannot show histogram.")
+            print("Install with: pip install matplotlib")
+    
+    # Test loading a sample
+    print("\nTesting data loading...")
+    try:
+        sample = dataset[0]
+        print(f"  Sample shapes:")
+        print(f"    Images: {sample['image'].shape}")
+        print(f"    Actions: {sample['action'].shape}")
+        print(f"  Sample dtypes:")
+        print(f"    Images: {sample['image'].dtype}")
+        print(f"    Actions: {sample['action'].dtype}")
+        print(f"  Image value range: [{sample['image'].min():.3f}, {sample['image'].max():.3f}]")
+        print("  ✓ Data loading successful!")
+    except Exception as e:
+        print(f"  ✗ Error loading data: {e}")
+    
+    print("\n" + "="*70)

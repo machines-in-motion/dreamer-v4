@@ -61,7 +61,6 @@ def process_episode(episode, episode_idx, output_dir, verbose=False):
         'file': str(episode_file),
     }
 
-
 def convert_rlds_to_numpy(
     rlds_dir: str,
     output_dir: str,
@@ -156,7 +155,6 @@ def convert_rlds_to_numpy(
     print(f"  Total size: {total_size / (1024**3):.2f} GB")
     print(f"{'='*60}")
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Convert RLDS dataset to NumPy format"
@@ -194,7 +192,6 @@ def main():
         split=args.split,
         max_episodes=args.max_episodes,
     )
-
 
 if __name__ == "__main__":
     main()

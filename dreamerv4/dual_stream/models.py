@@ -124,8 +124,6 @@ class KVCache:
         self.k_cache.zero_()
         self.v_cache.zero_()
 
-# --------- Utilities ---------
-
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.0):
         super().__init__()
@@ -747,7 +745,6 @@ class BlockCausalDecoderLayer(nn.Module):
                 R_out, L_out = _forward_temporal(R, L, kv_cache_l, kv_cache_r, position_ids, update_cache)
 
         return R_out, L_out
-
 
 class DreamerV4Decoder(nn.Module):
     """
