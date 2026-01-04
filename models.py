@@ -7,6 +7,84 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.checkpoint import checkpoint
 import numpy as np
 
+class SymlogTwoHotHead(nn.Module):
+    def __init__(self, input_dim, num_buckets=255, min_val=-20.0, max_val=20.0):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.min_val = min_val
+        self.max_val = max_val
+        self.linear = nn.Linear(input_dim, num_buckets)
+        
+        # Create bucket values [min, max]
+        buckets = torch.linspace(min_val, max_val, num_buckets)
+        self.register_buffer("buckets", buckets)
+
+    def forward(self, x):
+        return self.linear(x)
+
+    def to_symlog(self, x):
+        return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+    def from_symlog(self, x):
+        return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+    def get_targets(self, rewards):
+        # rewards: (B, T, L)
+        y = self.to_symlog(rewards)
+        
+        # Scale to bucket indices
+        width = (self.max_val - self.min_val) / (self.num_buckets - 1)
+        indices = (y - self.min_val) / width
+        
+        # Clamp indices to valid range [0, N-1]
+        # This prevents negative weights if rewards are out of bounds
+        indices = indices.clamp(0, self.num_buckets - 1)
+        
+        low = indices.floor().long()
+        high = indices.ceil().long()
+        
+        # Interpolation weights
+        # Since low and high are integers, high - low is either 0 or 1.
+        low_weight = high.float() - indices
+        high_weight = indices - low.float()
+        
+        # Handle exact integer case (low == high) where weights might be 0.0/0.0
+        # actually with the logic above: 
+        # if indices=5.0, low=5, high=5 -> low_w=0.0, high_w=0.0. 
+        # This is WRONG. We need one of them to be 1.0.
+        
+        mask = (low == high)
+        low_weight[mask] = 1.0
+        high_weight[mask] = 0.0
+        
+        return low, low_weight, high, high_weight
+
+class RewardMTPHead(nn.Module):
+    def __init__(self, input_dim, hidden_dim=512, mtp_length=8, num_buckets=255):
+        super().__init__()
+        self.mtp_length = mtp_length
+        self.hidden = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU()
+        )
+        # One head per MTP step
+        self.heads = nn.ModuleList([
+            SymlogTwoHotHead(hidden_dim, num_buckets) for _ in range(mtp_length)
+        ])
+
+    def forward(self, h_t):
+        """
+        h_t: (B, T, D) - Task output embeddings
+        Returns: logits (B, T, L, num_buckets)
+        """
+        x = self.hidden(h_t) # (B, T, hidden)
+        
+        outputs = []
+        for head in self.heads:
+            outputs.append(head(x)) # (B, T, buckets)
+            
+        return torch.stack(outputs, dim=2) # (B, T, L, buckets)
+
 class KVCache:
     """
     Simple rolling buffer for KV caching.
@@ -258,7 +336,7 @@ class MHA_GQA(nn.Module):
             k = k.reshape(prefix_prod, *k.shape[-3:])  # [prefix_prod, G, Skv, Dh]
             v = v.reshape(prefix_prod, *v.shape[-3:])  # [prefix_prod, G, Skv, Dh]
             # SDPA on merged 4D
-            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
                 out = F.scaled_dot_product_attention(
                     query=q, key=k, value=v,
                     attn_mask=attn_mask, is_causal=effective_causal,
@@ -270,7 +348,7 @@ class MHA_GQA(nn.Module):
             out = out.view(*prefix_shape, *out.shape[-3:])  # [..., Hq, Sq, Dh]
         else:
             # Direct 4D (standard [B, Hq, Sq, Dh])
-            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
                 out = F.scaled_dot_product_attention(
                     query=q, key=k, value=v,
                     attn_mask=attn_mask, is_causal=effective_causal,
@@ -845,17 +923,27 @@ class DreamerV4Decoder(nn.Module):
 
 class BlockCausalDynamicsLayer(nn.Module):
     """
-    A single layer of the Dynamics Transformer.
-    Alternates between Spatial Attention (mixing tokens within a frame) 
-    and Temporal Attention (mixing history for a specific token position).
+    Unified Dynamics Layer. 
+    Handles both World and Agent tokens in a single stream via masking.
     """
-    def __init__(self, d_model, num_heads, seq_len, num_tokens, dropout=0.0, mlp_ratio=4.0, temporal=False):
+    def __init__(self,
+                 d_model,
+                 num_heads,
+                 seq_len,
+                 num_tokens,
+                 dropout=0.0,
+                 mlp_ratio=4.0,
+                 temporal=False,
+                 is_last: bool = False):
         super().__init__()
         self.d_model = d_model
         self.temporal = temporal
-        
+        self.is_last = is_last
+
+        # Single stream components
         self.norm1 = nn.RMSNorm(d_model, eps=1e-6)
-        # Dynamics has a single stream of tokens, so we use Self-Attention (Hq=Hkv)
+        
+        # MHA handles both World and Agent (if present)
         self.attn = MHA_GQA(
             d_model=d_model,
             num_heads_q=num_heads,
@@ -867,57 +955,59 @@ class BlockCausalDynamicsLayer(nn.Module):
         
         self.norm2 = nn.RMSNorm(d_model, eps=1e-6)
         self.ffn = FeedForwardSwiGLU(d_model, int(d_model * mlp_ratio * 2 / 3), dropout=dropout)
-        
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, kv_cache: Optional[KVCache] = None, position_ids: Optional[torch.Tensor] = None, update_cache=True):
-        # x: (B, T, N, D)
+    def forward(self, x, attn_mask=None, kv_cache=None, position_ids=None, update_cache=True):
+        # x: (B, T, N, D) - N includes Agent token if present
         B, T, N, D = x.shape
         
-        skip = x
-        x = self.norm1(x)
+        skip_x = x
+        x_norm = self.norm1(x)
         
         if self.temporal:
-            # Temporal Attention: Independent per token index 'n', causal over 't'
-            # Reshape to (B*N, T, D) to treat each token position as a separate sequence
-            x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
-            x = self.attn(x, x, is_causal=True, kv_cache=kv_cache, 
-                          q_position_ids=position_ids, kv_position_ids=position_ids,
-                          update_cache=update_cache)
-            x = x.view(B, N, T, D).permute(0, 2, 1, 3)
+            # Temporal: Each token attends to its OWN history (Causal on T)
+            # Reshape: (B, T, N, D) -> (B*N, T, D) for standard MHA
+            x_flat = x_norm.permute(0, 2, 1, 3).reshape(-1, T, self.d_model)
+            
+            # is_causal=True handles the temporal masking automatically
+            x_attn = self.attn(x_flat, x_flat, is_causal=True, kv_cache=kv_cache,
+                               q_position_ids=position_ids, kv_position_ids=position_ids,
+                               update_cache=update_cache)
+            
+            x_attn = x_attn.view(B, N, T, D).permute(0, 2, 1, 3)
         else:
-            # Spatial Attention: Independent per timestep 't', dense over 'n'
-            # Reshape to (B*T, N, D) to treat each frame as a separate sequence
-            x = x.view(B * T, N, D)
-            x = self.attn(x, x, is_causal=False)
-            x = x.view(B, T, N, D)
+            # Spatial: Tokens attend to other tokens in the same frame (Masked on N)
+            # Reshape: (B, T, N, D) -> (B*T, N, D)
+            x_flat = x_norm.view(-1, N, self.d_model)
             
-        x = self.dropout(x)
-        x = x + skip
-        
-        skip = x
-        x = self.norm2(x)
-        x = self.ffn(x)
-        x = self.dropout(x)
-        x = x + skip
+            # Use the provided attn_mask to prevent World -> Agent attention
+            x_attn = self.attn(x_flat, x_flat, attn_mask=attn_mask, is_causal=False)
             
+            x_attn = x_attn.view(B, T, N, D)
+            
+        x = skip_x + self.dropout(x_attn)
+        x = x + self.dropout(self.ffn(self.norm2(x)))
+
+        # Return single stream
         return x
 
 class DreamerV4Dynamics(nn.Module):
     def __init__(
         self,
         action_dim: int,
-        num_latents: int,      # Number of spatial tokens (z) per frame (e.g., 256)
-        latent_dim: int,       # Dimension of the bottleneck (db) (e.g., 32)
+        num_latents: int,
+        latent_dim: int,
         d_model: int = 1024,
         num_layers: int = 12,
         num_heads: int = 16,
         num_registers: int = 4,
-        seq_len: int = 96,    # Context length
+        seq_len: int = 96,
         dropout: float = 0.1,
         mlp_ratio: float = 4.0,
-        num_tau_levels: int = 128,  # For discrete noise level embedding
-        temporal_every: int = 4       # Apply temporal attention every K layers
+        num_tau_levels: int = 128,
+        temporal_every: int = 4,
+        train_reward_model: bool = False,
+        mtp_length: int = 8,
     ):
         super().__init__()
         num_step_levels = int(np.log2(num_tau_levels)) + 1
@@ -925,156 +1015,181 @@ class DreamerV4Dynamics(nn.Module):
         self.latent_dim = latent_dim
         self.d_model = d_model
         self.num_registers = num_registers
-        
+        self.train_reward_model = train_reward_model
+
+        # --- Agent Token ---
+        if self.train_reward_model:
+            self.agent_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
+            self.reward_head = RewardMTPHead(input_dim=d_model, mtp_length=mtp_length)
+        else:
+            self.register_parameter('agent_token', None)
+            self.reward_head = None
+
         # --- Embeddings ---
-        # 1. Action Embedding (Continuous vector)
         self.act_proj = nn.Linear(action_dim, d_model)
-        
-        # 2. Noise/Step Embedding
-        # Paper: "encode each with a discrete embedding lookup and concatenate their channels"
-        # We embed sigma and step to d_model/2 and concat to get d_model.
         self.sigma_embed = nn.Embedding(num_tau_levels, d_model // 2)
         self.step_embed = nn.Embedding(num_step_levels, d_model // 2)
-        
-        # 3. Latent Projection (db -> d_model)
         self.z_proj = nn.Linear(latent_dim, d_model)
-        
-        # 4. Register Tokens (Learned)
         self.register_tokens = nn.Parameter(torch.randn(num_registers, d_model) * 0.02)
         
+        # --- Token Counts ---
+        # World tokens: Action + Noise + Registers + Latents
+        self.num_world_tokens = 1 + 1 + num_registers + num_latents
+        # Total tokens passed to layers (World + Agent if present)
+        self.total_tokens = self.num_world_tokens + (1 if train_reward_model else 0)
+
         # --- Transformer ---
         layers = []
-        # Total tokens per timestep: 1 (Action) + 1 (Sigma/Step) + Registers + Latents
-        self.num_tokens_per_step = 1 + 1 + num_registers + num_latents
-        
         for i in range(num_layers):
-            # Follows paper's logic: Temporal only every 4 layers (default), otherwise Spatial
-            # Note: This simple logic puts temporal at indices 3, 7, 11...
             is_temporal = ((i + 1) % temporal_every == 0)
-            
             layers.append(BlockCausalDynamicsLayer(
                 d_model=d_model,
                 num_heads=num_heads,
                 seq_len=seq_len,
-                num_tokens=self.num_tokens_per_step,
+                num_tokens=self.total_tokens, # Use total count including agent
                 dropout=dropout,
                 mlp_ratio=mlp_ratio,
                 temporal=is_temporal,
+                is_last=(i == num_layers-1)
             ))
         self.layers = nn.ModuleList(layers)
         
-        # --- Output Head ---
-        # Predict clean representations (x-prediction)
         self.out_proj = nn.Linear(d_model, latent_dim)
+
+        # --- Spatial Mask ---
+        # If training reward, we need a mask to hide the Agent token from World tokens
+        if self.train_reward_model:
+            # Create a float mask. 0.0 means "attend", -1e9 means "ignore".
+            # We use float32 for the buffer, but will cast it in forward.
+            mask = torch.zeros(self.total_tokens, self.total_tokens, dtype=torch.float32)
+            
+            # Mask out the Agent token (last column) for all World tokens (rows 0 to N-2)
+            # Use -1e9 which is safe for bfloat16/float16/float32
+            mask[:-1, -1] = -1e9
+            
+            self.register_buffer('spatial_mask', mask, persistent=False)
 
     def forward(self,
                 action: torch.Tensor,
                 noisy_z: torch.Tensor,
                 sigma_idx: torch.Tensor,
                 step_idx: torch.Tensor):
-        """
-        Args:
-            action: (B, T, action_dim) - Actions taken at each step
-            noisy_z: (B, T, num_latents, latent_dim) - Corrupted representations
-            sigma_idx: (B, T) - Indices for noise level
-            step_idx: (B, T) - Indices for step size
-        Returns:
-            pred_z: (B, T, num_latents, latent_dim) - Predicted clean representations
-        """
+        
         B, T, _, _ = noisy_z.shape
         
-        # 1. Prepare Embeddings
-        # Action: (B, T, 1, D)
+        # 1. Prepare Embeddings (Same as before)
         emb_act = self.act_proj(action).unsqueeze(2)
-        
-        # Sigma/Step: (B, T, 1, D)
         emb_sigma = self.sigma_embed(sigma_idx)
         emb_step = self.step_embed(step_idx)
         emb_noise = torch.cat([emb_sigma, emb_step], dim=-1).unsqueeze(2)
-        
-        # Registers: (B, T, Nr, D)
         emb_reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        
-        # Latents: (B, T, Nl, D)
         emb_z = self.z_proj(noisy_z)
         
-        # 2. Interleave / Concatenate Inputs
-        # Order: [Action, Noise, Registers, Latents]
-        # Shape: (B, T, 1+1+Nr+Nl, D)
-        x = torch.cat([emb_act, emb_noise, emb_reg, emb_z], dim=2)
-        
-        # 3. Apply Transformer Layers
-        for layer in self.layers:
-            x = layer(x)
-            
-        # 4. Extract and Project Outputs
-        # We only need the predictions corresponding to the latent tokens (the last Nl tokens)
-        out_z_tokens = x[:, :, -self.num_latents:, :]
-        pred_z = self.out_proj(out_z_tokens)
-        
-        return pred_z
+        # 2. Concatenate World Stream
+        # [Action, Noise, Registers, Latents]
+        x = torch.cat([emb_act, emb_noise, emb_reg, emb_z], dim=2) 
 
-    def init_cache(self, batch_size: int, device: torch.device, max_seq_len: int = 96):
-        """Initializes KV caches for all temporal layers."""
-        self.caches = []
+        # 3. Append Agent Token (if needed)
+        if self.train_reward_model:
+            # Expand agent token to (B, T, 1, D)
+            agent_part = self.agent_token.view(1, 1, 1, self.d_model).expand(B, T, -1, -1)
+            x = torch.cat([x, agent_part], dim=2)
+
+        # 4. Apply Layers
         for layer in self.layers:
             if layer.temporal:
-                # Temporal cache needs to store (Batch * Num_Tokens) streams
-                # Batch size for cache = B * num_tokens_per_step
-                cache_bs = batch_size * self.num_tokens_per_step
-                
-                cache = KVCache(
-                    max_seq_len=max_seq_len,
-                    batch_size=cache_bs,
-                    num_heads=self.layers[0].attn.Hq, # Assuming uniform heads
-                    head_dim=self.layers[0].attn.Dh,
-                    device=device,
-                    dtype=self.act_proj.weight.dtype
-                )
-                self.caches.append(cache)
+                # Temporal layers don't use spatial mask (each token attends to its own history)
+                x = layer(x)
             else:
-                self.caches.append(None) # Spatial layers don't cache time
+                if self.train_reward_model:
+                    # CRITICAL FIX: Cast mask to match x.dtype (bfloat16)
+                    # This enables Memory Efficient Attention kernels to work
+                    mask = self.spatial_mask.to(dtype=x.dtype)
+                    x = layer(x, attn_mask=mask)
+                else:
+                    x = layer(x)
+
+        # 5. Outputs
+        if self.train_reward_model:
+            # Separate World and Agent
+            # World: x[:, :, :-1, :]
+            # Agent: x[:, :, -1, :]
+            
+            # Latents are at the end of the WORLD part
+            world_x = x[:, :, :-1, :]
+            out_z_tokens = world_x[:, :, -self.num_latents:, :]
+            pred_z = self.out_proj(out_z_tokens)
+            
+            agent_x = x[:, :, -1, :] # (B, T, D)
+            pred_rewards = self.reward_head(agent_x)
+        else:
+            # No agent token, standard slicing
+            out_z_tokens = x[:, :, -self.num_latents:, :]
+            pred_z = self.out_proj(out_z_tokens)
+            pred_rewards = None
+
+        return pred_z, pred_rewards
 
     def forward_step(self, 
                      action: torch.Tensor, 
                      noisy_z: torch.Tensor, 
                      sigma_idx: torch.Tensor, 
                      step_idx: torch.Tensor,
-                     start_step_idx: int,  # Absolute position for RoPE
+                     start_step_idx: int,
                      update_cache: bool = True):
-        """
-        Autoregressive forward for a single timestep T=1.
-        Must call init_cache() before starting loop.
-        """
-        # Inputs are [B, 1, ...]
+        
         B, T, _, _ = noisy_z.shape
         
-        # 1. Embeddings (Same as forward)
-        emb_act = self.act_proj(action).unsqueeze(2) # [B, 1, 1, D]
+        # 1. Embeddings
+        emb_act = self.act_proj(action).unsqueeze(2)
         emb_sigma = self.sigma_embed(sigma_idx)
         emb_step = self.step_embed(step_idx)
         emb_noise = torch.cat([emb_sigma, emb_step], dim=-1).unsqueeze(2)
         emb_reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
         emb_z = self.z_proj(noisy_z)
         
-        # Concatenate: [B, 1, N_total, D]
+        # 2. Concatenate World Stream
         x = torch.cat([emb_act, emb_noise, emb_reg, emb_z], dim=2)
         
-        # Position IDs for RoPE
-        # We need [T] indices starting from start_step_idx
-        # Shape [1, T] to broadcast over batch
+        # Note: In inference (forward_step), we usually don't need the Reward Model output.
+        # Since the World tokens are trained to IGNORE the Agent token, 
+        # we can simply skip appending the Agent token here.
+        # This works perfectly with the unified weights because the World tokens
+        # only ever attended to the first N tokens anyway.
+        
         pos_ids = torch.arange(start_step_idx, start_step_idx + T, device=x.device, dtype=torch.long)
-        pos_ids = pos_ids.unsqueeze(0) # [1, T]
+        pos_ids = pos_ids.unsqueeze(0)
 
-        # 2. Apply Layers with Caching
+        # 3. Apply Layers
         for i, layer in enumerate(self.layers):
             if layer.temporal:
                 x = layer(x, kv_cache=self.caches[i], position_ids=pos_ids, update_cache=update_cache)
             else:
+                # No mask needed if Agent token is absent
                 x = layer(x)
 
-        # 3. Output
+        # 4. Output
         out_z_tokens = x[:, :, -self.num_latents:, :]
         pred_z = self.out_proj(out_z_tokens)
         
         return pred_z
+    
+    def init_cache(self, batch_size: int, device: torch.device, max_seq_len: int = 96):
+        """Initializes KV caches for all temporal layers."""
+        self.caches = []
+        for layer in self.layers:
+            if layer.temporal:
+                # We only cache World tokens in inference as per forward_step optimization
+                cache_bs = batch_size * self.num_world_tokens
+                
+                cache = KVCache(
+                    max_seq_len=max_seq_len,
+                    batch_size=cache_bs,
+                    num_heads=self.layers[0].attn.Hq,
+                    head_dim=self.layers[0].attn.Dh,
+                    device=device,
+                    dtype=self.act_proj.weight.dtype
+                )
+                self.caches.append(cache)
+            else:
+                self.caches.append(None)

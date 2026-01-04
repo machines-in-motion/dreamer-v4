@@ -129,6 +129,146 @@ class ShardedHDF5Dataset(Dataset):
         
         return stats
 
+class HDF5SequenceDataset(Dataset):
+    """
+    Dataset that creates sliding windows from a directory of independent .h5 files.
+    It automatically parses 'dones' to ensure windows do not cross episode boundaries.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        window_size: int,
+        stride: int = 1,
+    ):
+        """
+        Args:
+            data_dir: Directory containing .h5 files.
+            window_size: Sequence length (batch time dimension).
+            stride: Step size between windows.
+        """
+        self.data_dir = Path(data_dir)
+        self.window_size = window_size
+        self.stride = stride
+        
+        # Find all H5 files
+        self.h5_files = sorted([
+            f for f in self.data_dir.glob("*.h5") 
+            if "shard" not in f.name # Exclude shard files if mixed
+        ])
+        
+        if not self.h5_files:
+            raise ValueError(f"No .h5 files found in {data_dir}")
+
+        # Indexing structure: list of (file_index, start_frame_index)
+        self.windows = []
+        
+        print(f"Scanning {len(self.h5_files)} files for valid episodes...")
+        
+        total_frames = 0
+        total_episodes = 0
+        
+        for file_idx, file_path in enumerate(self.h5_files):
+            try:
+                with h5py.File(file_path, 'r') as f:
+                    if 'dones' not in f or 'images' not in f:
+                        print(f"Skipping {file_path.name}: missing datasets")
+                        continue
+                        
+                    n_frames = len(f['images'])
+                    dones = f['dones'][:]
+                    
+                    # Identify Episode Boundaries
+                    # An episode ends where done=1.
+                    # We need start and end indices for every continuous segment.
+                    
+                    # Indices where done == 1
+                    done_indices = np.where(dones > 0.5)[0]
+                    
+                    # Episode Starts: [0] + [idx+1 for idx in done_indices if idx+1 < n_frames]
+                    # Episode Ends:   [idx+1 for idx in done_indices] + [n_frames] (if last frame isn't done)
+                    
+                    # Simpler logic: Iterate through done indices to carve out chunks
+                    start_idx = 0
+                    
+                    # Add a synthetic done at the very end to close the last loop
+                    all_boundaries = list(done_indices)
+                    if len(all_boundaries) == 0 or all_boundaries[-1] != n_frames - 1:
+                        all_boundaries.append(n_frames - 1)
+                        
+                    for end_idx in all_boundaries:
+                        # The episode is valid from start_idx to end_idx (inclusive)
+                        # Length = end_idx - start_idx + 1
+                        
+                        # Generate windows for this segment
+                        # Valid starts: range(segment_start, segment_end - window_size + 2, stride)
+                        # Example: Ep len 50, window 50. range(0, 0+1) -> [0]. Window 0:50.
+                        
+                        # Note: HDF5 slicing [start:end] is exclusive at end, so we use end_idx + 1
+                        segment_len = (end_idx - start_idx) + 1
+                        
+                        if segment_len >= self.window_size:
+                            num_windows_in_ep = (segment_len - self.window_size) // self.stride + 1
+                            
+                            for k in range(num_windows_in_ep):
+                                global_start = start_idx + (k * self.stride)
+                                self.windows.append((file_idx, global_start))
+                            
+                            total_episodes += 1
+                        
+                        # Next episode starts after this done
+                        start_idx = end_idx + 1
+                        
+                    total_frames += n_frames
+                    
+            except Exception as e:
+                print(f"Error reading {file_path.name}: {e}")
+
+        print(f"Found {len(self.windows)} windows across {total_episodes} valid episodes.")
+        print(f"Total raw frames processed: {total_frames}")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        file_idx, start_frame = self.windows[idx]
+        file_path = self.h5_files[file_idx]
+        end_frame = start_frame + self.window_size
+
+        with h5py.File(file_path, 'r') as f:
+            images = f['images'][start_frame:end_frame]  # [T, H, W, 3] (BGR)
+            commands = f['commands'][start_frame:end_frame]
+            dones = f['dones'][start_frame:end_frame]
+
+            # --- Handle optional is_demo field ---
+            if 'is_demo' in f:
+                is_demo = f['is_demo'][start_frame:end_frame]
+            else:
+                # Create zeros matching the sequence length
+                is_demo = np.zeros((self.window_size, 1), dtype=np.float32)
+
+        # --- Convert BGR to RGB ---
+        # Numpy array slicing is the fastest way to do this
+        images = images[..., ::-1].copy()
+
+        # Convert to Torch
+        images = torch.from_numpy(images).float() / 255.0
+        images = images.permute(0, 3, 1, 2)  # [T, C, H, W]
+        
+        commands = torch.from_numpy(commands).float()
+        dones = torch.from_numpy(dones).float()
+
+        # Ensure is_demo is a tensor
+        if isinstance(is_demo, np.ndarray):
+            is_demo = torch.from_numpy(is_demo).float()
+
+        return {
+            'image': images,
+            'action': commands,
+            'done': dones,
+            'is_demo': is_demo
+        }
+
 if __name__ == "__main__":
     import argparse
     

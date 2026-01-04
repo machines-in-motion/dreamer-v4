@@ -6,7 +6,7 @@
 #SBATCH --constraint='h200'
 #SBATCH --cpus-per-task=16                 # CPU cores per GPU
 #SBATCH --mem=64GB                         # Request all memory on node
-#SBATCH --time=00:30:00                    # Max runtime
+#SBATCH --time=64:00:00                    # Max runtime
 #SBATCH --output=logs/dreamer_eval_%j.out       # Output log
 #SBATCH --error=logs/dreamer_eval_%j.err        # Error log
 #SBATCH --account torch_pr_155_tandon_advanced

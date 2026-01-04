@@ -20,26 +20,58 @@ from functools import partial
 
 from models import (
     DreamerV4Encoder,
+    DreamerV4Decoder,
     BlockCausalEncoderLayer,
-    DreamerV4Dynamics,
-    BlockCausalDynamicsLayer
+    BlockCausalDecoderLayer,
 )
 
-from dataset import ShardedHDF5Dataset
+from dataset import HDF5SequenceDataset
+import lpips
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 import datetime
 import math
-from datetime import timedelta
-import numpy as np
+
+class RMSLossScaler:
+    """
+    Tracks running RMS for named losses and returns normalized losses.
+    """
+    def __init__(self, decay: float = 0.99, eps: float = 1e-8):
+        self.decay = decay
+        self.eps = eps
+        self.ema_sq = {}  # name -> scalar tensor
+
+    def __call__(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        # value is a scalar loss tensor (per-batch, per-rank)
+        with torch.no_grad():
+            sq = value.detach().pow(2)
+            mean_sq = sq.mean()
+
+            # Optionally average across ranks for a global RMS
+            if dist.is_initialized():
+                dist.all_reduce(mean_sq, op=dist.ReduceOp.AVG)
+
+            if name not in self.ema_sq:
+                self.ema_sq[name] = mean_sq
+            else:
+                self.ema_sq[name] = (
+                    self.decay * self.ema_sq[name] + (1.0 - self.decay) * mean_sq
+                )
+
+            rms = (self.ema_sq[name] + self.eps).sqrt()
+
+        # Normalize current loss by running RMS; gradient flows only through value
+        return value / rms
 
 def save_checkpoint(
     ckpt_path: str,
     epoch: int,
     global_update: int,
-    dyn: FSDP,
+    enc: FSDP,
+    dec: FSDP,
     optim: torch.optim.Optimizer,
     scheduler,
+    rms_norm: RMSLossScaler,
     rank: int,
     wandb_run_id: str = None,
     log_dir: str = None,
@@ -52,8 +84,10 @@ def save_checkpoint(
     # ALL RANKS must participate in this, even though only rank 0 gets the result
     full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
 
-    with FSDP.state_dict_type(dyn, StateDictType.FULL_STATE_DICT, full_cfg):
-        dyn_state = dyn.state_dict()  # All ranks participate in gather
+    with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
+        enc_state = enc.state_dict()  # All ranks participate in gather
+    with FSDP.state_dict_type(dec, StateDictType.FULL_STATE_DICT, full_cfg):
+        dec_state = dec.state_dict()  # All ranks participate in gather
 
     # Only rank 0 saves to disk
     if rank == 0:
@@ -62,9 +96,11 @@ def save_checkpoint(
         ckpt = {
             "epoch": epoch,
             "global_update": global_update,
-            "dyn": dyn_state,
+            "enc": enc_state,
+            "dec": dec_state,
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "rms_norm": rms_norm.ema_sq,
             "wandb_run_id": wandb_run_id,
             "log_dir": log_dir,
         }
@@ -74,9 +110,9 @@ def save_checkpoint(
 
 def load_checkpoint(
     ckpt_path: str,
-    dyn: FSDP,
-    optim: torch.optim.Optimizer,
-    scheduler,
+    enc: FSDP,
+    dec: FSDP,
+    rms_norm: RMSLossScaler,
     rank: int,
     device: torch.device,
 ):
@@ -109,11 +145,13 @@ def load_checkpoint(
     # Load full enc/dec state dicts into FSDP models
     full_cfg = FullStateDictConfig(rank0_only=False, offload_to_cpu=True)
 
-    with FSDP.state_dict_type(dyn, StateDictType.FULL_STATE_DICT, full_cfg):
-        dyn.load_state_dict(ckpt["dyn"])
+    with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
+        enc.load_state_dict(ckpt["enc"])
+    with FSDP.state_dict_type(dec, StateDictType.FULL_STATE_DICT, full_cfg):
+        dec.load_state_dict(ckpt["dec"])
 
-    optim.load_state_dict(ckpt["optim"])
-    scheduler.load_state_dict(ckpt["scheduler"])
+    # Restore RMS loss scaler state
+    rms_norm.ema_sq = ckpt.get("rms_norm", {})
 
     if rank == 0:
         print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}")
@@ -138,15 +176,13 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     
-
-    print(os.environ['MASTER_ADDR'], os.environ['MASTER_PORT'])
     # Initialize process group with NCCL backend
     # MASTER_ADDR and MASTER_PORT should be set in SLURM script
     dist.init_process_group(
         backend='nccl',
         init_method='env://',
         world_size=world_size,
-        rank=rank,
+        rank=rank
     )
     
     return rank, local_rank, world_size
@@ -161,36 +197,30 @@ def get_fsdp_wrap_policy():
     return partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            BlockCausalDynamicsLayer,
-            BlockCausalEncoderLayer
+            BlockCausalEncoderLayer,
+            BlockCausalDecoderLayer,
         },
     )
 
-def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD",
-                     fp32_params=False):
+def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"):
     """Wrap model with FSDP for distributed training."""
+    # Mixed precision policy for H200
     if mixed_precision:
-        if fp32_params:
-            mp_policy = MixedPrecision(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat32,
-            )
-        else:
-            mp_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
+        mp_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
     else:
         mp_policy = None
-
+    
+    # Map string to ShardingStrategy enum
     strategy_map = {
         "FULL_SHARD": ShardingStrategy.FULL_SHARD,
         "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
         "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
     }
-
+    
     fsdp_model = FSDP(
         model,
         sharding_strategy=strategy_map[sharding_strategy],
@@ -201,6 +231,7 @@ def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"
         limit_all_gathers=True,
         use_orig_params=True,
     )
+    
     return fsdp_model
 
 def create_distributed_dataloader(
@@ -212,9 +243,6 @@ def create_distributed_dataloader(
     num_workers: int = 4,
     stride: int = 1,
     seed: int = 42,
-    split: str = "train",
-    train_fraction: float = 0.9,
-    split_seed: int = 42,
     shuffle: bool = True,
     drop_last: bool = True,
 ):
@@ -222,13 +250,10 @@ def create_distributed_dataloader(
     Create DataLoader with DistributedSampler for sharded HDF5 dataset.
     """
     # Create the dataset with a fixed split
-    dataset = ShardedHDF5Dataset(
+    dataset = HDF5SequenceDataset(
         data_dir=data_dir,
         window_size=window_size,
         stride=stride,
-        split=split,
-        train_fraction=train_fraction,
-        split_seed=split_seed,
     )
 
     # Create DistributedSampler
@@ -268,220 +293,37 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-@torch.no_grad()
-def load_pretrained_tokenizer_encoder(ckpt_path: str, device: torch.device, enc_kwargs: dict, compile):
-    """
-    Load pretrained DreamerV4Encoder from a tokenizer checkpoint and freeze it.
-    Expects a checkpoint saved by your tokenizer script with key 'enc'.
-    """
-    enc = DreamerV4Encoder(**enc_kwargs).to(device)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    if compile:
-        enc = torch.compile(enc, mode="max-autotune", fullgraph=False)
-    enc_state = ckpt.get("enc", None)
-    if enc_state is None:
-        raise RuntimeError("Checkpoint missing 'enc' weights; provide a tokenizer ckpt saved by your tokenizer training script.")
-    # Load full (unsharded) weights directly since we are not wrapping the encoder with FSDP
-    enc.load_state_dict(enc_state)
-    enc.eval()
-    for p in enc.parameters():
-        p.requires_grad_(False)
-    return enc
-
-def sample_shortcut_batch(B, T, device, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels):
-    """
-    Samples (tau, d) parameters for Diffusion Forcing with Shortcut split.
-    
-    - Allocation is DETERMINISTIC based on distributed RANK.
-    - First 75% of ranks -> Flow Matching (d = d_min).
-    - Last 25% of ranks -> Shortcut (d > d_min).
-    - Noise parameters are sampled per-step (B, T).
-    
-    Returns:
-        tau_vals: (B,T) float
-        d_vals:   (B,T) float
-        tau_idxs: (B,T) long
-        step_idxs: (B,T) long
-    """
-    # 1. Determine Task based on micro_idx
-    # First 75% flow matching, rest shortcut
-    cutoff = int(GRAD_ACCUM_STEPS * 0.75)
-    is_flow_worker = (micro_idx < cutoff)
-    
-    # 2. Dynamic Grid Constants
-    # If num_tau_levels = 64, d_min_idx = 6 (corresponding to 1/64 step)
-    # Columns are 0..6.
-    d_min_idx = int(np.log2(num_tau_levels))
-    
-    # Initialize indices
-    tau_idxs = torch.zeros(B, T, dtype=torch.long, device=device)
-    step_idxs = torch.zeros(B, T, dtype=torch.long, device=device)
-    
-    if is_flow_worker:
-        # --- Flow Matching Case (d = d_min) ---
-        # Step index is fixed to d_min_idx
-        step_idxs.fill_(d_min_idx)
-        
-        # Valid tau rows i are 0..(2^d_min_idx - 1) i.e., 0..63
-        # Sample uniformly for every step in (B, T)
-        tau_idxs = torch.randint(0, num_tau_levels, (B, T), device=device)
-        
-    else:
-        # --- Shortcut Case (d > d_min) ---
-        # Sample step level j from 0..(d_min_idx - 1)
-        # This corresponds to steps 1.0, 0.5, ..., strictly larger than d_min
-        # (B, T) independent samples
-        s_cols = torch.randint(0, d_min_idx, (B, T), device=device)
-        step_idxs = s_cols
-        
-        # For a given col j, valid i is [0, 2^j - 1]
-        # Vectorized sampling: i = floor(u * 2^j)
-        max_rows = (2.0 ** s_cols) # Float tensor (B, T)
-        u = torch.rand(B, T, device=device)
-        
-        # Clamp to ensure numerical stability doesn't push to 2^j
-        s_rows = (u * max_rows).floor().long()
-        tau_idxs = s_rows
-
-    # 3. Reconstruct Float Values
-    # Formula: val = (idx + 1) * (1 / 2^step)
-    # We use 0.5 ** step_idxs for efficiency
-    d_vals = (0.5 ** step_idxs.float())
-    
-    # tau = (i + 1) * d
-    tau_vals = 1 - (tau_idxs.float() + 1.0) * d_vals
-    
-    # We need each noise level to be associated to a unique id
-    real_tau_idxs = ((tau_idxs+1)*(2**(d_min_idx-step_idxs))).long()-1
-    return tau_vals, d_vals, real_tau_idxs, step_idxs
-
-def add_noise_flow_matching(z_clean, tau):
-    """
-    DreamerV4 / Flow Matching interpolation:
-    x_tau = (1 - tau) * x_0 + tau * x_1
-    where x_1 is data (z_clean), x_0 is noise.
-    tau=1 -> Clean, tau=0 -> Noise.
-    """
-    B, T, N, D = z_clean.shape
-    eps = torch.randn_like(z_clean)
-    # tau shape (B,T) -> (B,T,1,1)
-    tau_ex = tau.view(B, T, 1, 1)
-    z_noisy = (1 - tau_ex) * eps + tau_ex * z_clean
-    return z_noisy
-
-def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idxs, step_idxs, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels):
-    """
-    Computes combined Flow Matching + Shortcut Loss.
-    Determines Flow vs Shortcut based on Rank (same logic as sampler).
-    """
-    B, T, N, D = z_clean.shape
-
-    tau_vals = tau_vals.to(dtype=z_clean.dtype)
-    d_vals = d_vals.to(dtype=z_clean.dtype)
-
-    # 1. Re-determine Task based on micro_idx
-    cutoff = int(GRAD_ACCUM_STEPS * 0.75)
-    is_flow_worker = (micro_idx < cutoff)
-    d_min_idx = int(np.log2(num_tau_levels))
-    
-    # 2. Create Noisy Input
-    z_input = add_noise_flow_matching(z_clean, tau_vals)
-    
-    # 3. Student Prediction
-    pred_z1_student = dyn_model(actions, z_input, tau_idxs, step_idxs)
-    
-    # 4. Ramp Weighting
-    # w(tau) = 0.9 * tau + 0.1
-    # Weight is applied to the squared error before averaging
-    weights = 0.9 * tau_vals + 0.1
-    # Expand for broadcast: (B, T) -> (B, T, 1, 1)
-    weights = weights.view(*tau_vals.shape, 1, 1)
-
-    loss_flow = 0.0
-    loss_shortcut = 0.0
-    
-    if is_flow_worker:
-        # --- Flow Matching Loss (d = d_min) ---
-        # Target: z_clean
-        diff = pred_z1_student - z_clean
-        # Weighted MSE
-        loss_flow = (weights * (diff ** 2)).mean()
-        return loss_flow, loss_flow.detach().item(), 0.0
-    else:
-        # --- Shortcut Loss (d > d_min) ---
-        # This worker is dedicated to Shortcut logic.
-        # We assume the WHOLE batch on this GPU is shortcut data 
-
-        with torch.no_grad():
-            # Calculate Next Half-Step Params
-            # d_half = d / 2
-            d_half = d_vals / 2.0
-
-            # Step index for d/2 is step_idxs + 1
-            step_idxs_half = step_idxs + 1
-
-            tau_idxs_1 = tau_idxs
-
-            z_in_short = z_input
-
-            # --- Teacher 1: Start -> Middle ---
-            # Pred z1 from (z_tau, tau, d/2)
-            pred_z1_t1 = dyn_model(
-                actions,
-                z_in_short,
-                tau_idxs_1,
-                step_idxs_half
-            )
-
-            # Velocity b' = (pred - z) / (1 - tau)
-            # Prevent div by zero if tau=1 (though shortcut usually < 1)
-            denom_t1 = (1.0 - tau_vals.view(B, T, 1, 1) + 1e-6)
-            b_prime = (pred_z1_t1 - z_in_short) / denom_t1
-
-            # Advance state: z' = z + b' * d/2
-            z_prime = z_in_short + b_prime * d_half.view(B, T, 1, 1)
-
-            # --- Teacher 2: Middle -> End ---
-            # New tau = tau + d/2
-            tau_new_vals = tau_vals + d_half
-
-            # New unique ID for (tau + d/2)
-            tau_idxs_2 = tau_idxs_1 - (2 ** (d_min_idx - step_idxs_half)).long()
-
-            pred_z1_t2 = dyn_model(
-                actions,
-                z_prime,
-                tau_idxs_2,
-                step_idxs_half
-            )
-
-            # Velocity b'' = (pred - z') / (1 - tau_new)
-            denom_t2 = (1.0 - tau_new_vals.view(B, T, 1, 1) + 1e-6)
-            b_double_prime = (pred_z1_t2 - z_prime) / denom_t2
-
-            # Target Velocity
-            v_target = (b_prime + b_double_prime) / 2.0
-
-            # target_update = (1 - tau) * v_target
-            # This cancels out the denominator in the student's velocity term.
-            target_update = (1.0 - tau_vals.view(B, T, 1, 1)) * v_target
-
-        # Student Loss
-        # -------------------------------------------------
-        # Loss = || (z_student - z_tau) - target_update ||^2
-        student_update = pred_z1_student - z_input
-
-        diff = student_update - target_update
-
-        # Apply Ramp Weighting
-        loss_shortcut = (weights * (diff ** 2)).mean()
-
-        return loss_shortcut, 0.0, loss_shortcut.detach().item()
-
 def main():
     # Setup distributed training
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
+    
+    # LPIPS model (perceptual loss), kept outside FSDP and frozen
+    # Initialize only on rank 0 to avoid concurrent downloads; broadcast to other ranks
+    if rank == 0:
+        # Load with pretrained on rank 0 (succeeds reliably)
+        lpips_model = lpips.LPIPS(net='vgg').to(device=device, dtype=torch.bfloat16)
+        lpips_model.eval()
+        for p in lpips_model.parameters():
+            p.requires_grad_(False)
+    else:
+        # Other ranks: Create un-pretrained skeleton and load broadcasted weights
+        lpips_model = lpips.LPIPS(net='vgg', pretrained=False).to(device=device, dtype=torch.bfloat16)  # No download
+        lpips_model.eval()
+        for p in lpips_model.parameters():
+            p.requires_grad_(False)
+
+    if rank == 0:
+        sd = lpips_model.state_dict()
+    else:
+        sd = None
+
+    obj_list = [sd]
+    dist.broadcast_object_list(obj_list, src=0)
+    sd = obj_list[0]  # now the same dict on all ranks
+
+    if rank != 0:
+        lpips_model.load_state_dict(sd)
 
     # Print info only from rank 0
     if rank == 0:
@@ -497,7 +339,7 @@ def main():
     IMG_H, IMG_W = 128, 128 # 256, 256
     PATCH = 16
     CONTEXT_T = 96
-    N_LATENTS = 256 # 512
+    N_LATENTS = 512
     BOTTLENECK_D = 16
     D_MODEL = 768
     N_LAYERS = 12
@@ -506,24 +348,13 @@ def main():
     MLP_RATIO = 4.0
     TEMPORAL_EVERY = 4
     IN_CH = 3
-    NUM_TAU_LEVELS = 128
-    NUM_REGISTERS = 4
-
-    D_MODEL_DYN = 1024 # 2048
-    N_LAYERS_DYN = 16 # 32
-    HEADS_Q_DYN = 16 # 32
-    CONTEXT_T_DYN = 32 # 96
-
-    # Tokenizer checkpoint (encoder-only used, frozen)
-    #TOKENIZER_CKPT = "./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt"  # path to a saved tokenizer ckpt
-    TOKENIZER_CKPT = "./logs/dreamer_v4_tokenizer/2025-11-26_15-52-05/latest.pt"  # path to a saved tokenizer ckpt
-
+    
     # Batch size per GPU
-    BATCH_PER_GPU = 1
-    T = CONTEXT_T_DYN
-    NUM_EPOCHS = 30 # 65
-    #STEPS_PER_EPOCH = 20  # Limit steps per epoch for faster benchmarking
-    GRAD_ACCUM_STEPS = 10 # 10  # simulate batch size 10 per GPU
+    BATCH_PER_GPU = 2 # 1
+    T = CONTEXT_T
+    NUM_EPOCHS = 210
+    #STEPS_PER_EPOCH = 100  # Limit steps per epoch for faster benchmarking
+    GRAD_ACCUM_STEPS = 5 # 10  # simulate batch size 10 per GPU
     effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
@@ -534,11 +365,10 @@ def main():
     # Create models
     if rank == 0:
         print("Creating encoder and decoder models...")
-
-    # Load frozen encoder from tokenizer checkpoint
-    enc_kwargs = dict(
+    
+    enc = DreamerV4Encoder(
         image_size=(IMG_H, IMG_W),
-        patch_size=16,
+        patch_size=PATCH,
         d_model=D_MODEL,
         n_layers=N_LAYERS,
         num_heads_q=HEADS_Q,
@@ -549,157 +379,106 @@ def main():
         n_latents=N_LATENTS,
         bottleneck_dim=BOTTLENECK_D,
         temporal_every=TEMPORAL_EVERY,
-        in_channels=3,
-        mae_max_mask_prob=0.0,  # disabled at eval
+        in_channels=IN_CH,
+        mae_max_mask_prob=0.9,  # enable MAE
     )
-    enc = load_pretrained_tokenizer_encoder(TOKENIZER_CKPT, device=device, enc_kwargs=enc_kwargs, compile=True)
+    
+    dec = DreamerV4Decoder(
+        image_size=(IMG_H, IMG_W),
+        patch_size=PATCH,
+        d_model=D_MODEL,
+        n_layers=N_LAYERS,
+        num_heads_q=HEADS_Q,
+        num_heads_kv_latent=HEADS_KV_LATENT,
+        bottleneck_dim=BOTTLENECK_D,
+        seq_len=CONTEXT_T,
+        mlp_ratio=MLP_RATIO,
+        dropout=0.0,
+        n_latents=N_LATENTS,
+        in_channels=IN_CH,
+        temporal_every=TEMPORAL_EVERY,
+    )
+
+    # Move to correct device before compile (recommended ordering)
+    enc = enc.to(device)
+    dec = dec.to(device)
+
+    if USE_COMPILE:
+        # Good starting config; you can try other modes later
+        enc = torch.compile(enc, mode="max-autotune", fullgraph=False)
+        dec = torch.compile(dec, mode="max-autotune", fullgraph=False)
+
+    # Print parameter counts
+    if rank == 0:
+        learnable_params = sum(p.numel() for p in enc.parameters() if p.requires_grad)
+        learnable_params += sum(p.numel() for p in dec.parameters() if p.requires_grad)
+        print(f"Total learnable parameters: {learnable_params:,}")
+    
+    # Wrap with FSDP
+    if rank == 0:
+        print("Wrapping models with FSDP...")
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
-        data_dir="/scratch/ja5009/soar_data_sharded_128x128/",
-        window_size=CONTEXT_T_DYN,
+        data_dir="/scratch/ja5009/processed_logs/",
+        window_size=CONTEXT_T,
         batch_size=BATCH_PER_GPU,
         rank=rank,
         world_size=world_size,
         num_workers=4,
         stride=1,
         seed=42,
-        split="train",
-        train_fraction=0.9,
-        split_seed=123,   # controls which episodes go to train/test
         shuffle=True,
         drop_last=True,
     )
 
-    test_loader, test_sampler, test_dataset = create_distributed_dataloader(
-        data_dir="/scratch/ja5009/soar_data_sharded_128x128/",
-        window_size=CONTEXT_T_DYN,
-        batch_size=BATCH_PER_GPU,
-        rank=rank,
-        world_size=world_size,
-        num_workers=4,
-        stride=1,
-        seed=42,          # seed for sampler sharding (not for split itself)
-        split="test",
-        train_fraction=0.9,
-        split_seed=123,   # must match train_dataset
-        shuffle=False,    # evaluation: deterministic order
-        drop_last=False,  # keep all test windows
-    )
-
-    # Peek one batch to infer action_dim and instantiate dynamics + optimizer
-    first_batch = next(iter(train_loader))
-    action_dim = first_batch["action"].shape[-1]
-    if rank == 0:
-        print(f"Inferred action_dim={action_dim} from dataset batch")
-
-    dyn = DreamerV4Dynamics(
-        action_dim=action_dim,
-        num_latents=N_LATENTS,
-        latent_dim=BOTTLENECK_D,
-        d_model=D_MODEL_DYN,
-        num_layers=N_LAYERS_DYN,
-        num_heads=HEADS_Q_DYN,
-        num_registers=NUM_REGISTERS,
-        seq_len=CONTEXT_T_DYN,
-        dropout=0.0,
-        mlp_ratio=MLP_RATIO,
-        num_tau_levels=NUM_TAU_LEVELS,
-        temporal_every=TEMPORAL_EVERY,
-    ).to(device)
-
-    # Print parameter counts
-    if rank == 0:
-        learnable_params = sum(p.numel() for p in dyn.parameters() if p.requires_grad)
-        print(f"Total learnable parameters: {learnable_params:,}")
-
-    #enc = setup_fsdp_model(enc, mixed_precision=True, sharding_strategy="FULL_SHARD")
-    enc = enc.to(torch.bfloat16)
-    # dynamics: FP32 params to avoid BF16-param / FP32-grad bug
-    dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="FULL_SHARD",
-                       fp32_params=False)
-    #dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="FULL_SHARD",
-    #                   fp32_params=True)
-
-    #if USE_COMPILE:
-    #    dyn = torch.compile(dyn, mode="max-autotune-no-cudagraphs", fullgraph=False)
+    enc = setup_fsdp_model(enc, mixed_precision=True, sharding_strategy="FULL_SHARD")
+    dec = setup_fsdp_model(dec, mixed_precision=True, sharding_strategy="FULL_SHARD")
 
     # Create optimizer
-    optim = torch.optim.AdamW(dyn.parameters(), lr=1e-4, weight_decay=0.1)
+    params = list(enc.parameters()) + list(dec.parameters())
+    optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01) # try increasing to 0.03–0.05? (apparently normal range for tokenizer)
 
     steps_per_epoch = len(train_loader)
     STEPS_PER_EPOCH = steps_per_epoch
     total_steps = NUM_EPOCHS * steps_per_epoch // GRAD_ACCUM_STEPS
-    warmup_steps = int(0.05 * total_steps)  # 5% warmup
+    warmup_steps = 1400 # int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
-    RESUME_TRAINING = False
+    # RMS loss normalizer for tokenizer losses
+    rms_norm = RMSLossScaler(decay=0.99, eps=1e-8)
+
     wandb_run_id = None
     log_dir = None
-    ckpt_path = None
+    #ckpt_path = "./logs/dreamer_v4_tokenizer/2025-11-26_15-52-05/latest.pt"
+    ckpt_path = "./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt"
     start_epoch = 0
     global_update = 0  # counts optimizer updates
-    if RESUME_TRAINING:
-        # Try loading checkpoint BEFORE initializing W&B
-        start_epoch, global_update, wandb_run_id, log_dir = load_checkpoint(
-            ckpt_path=ckpt_path,
-            dyn=dyn,
-            optim=optim,
-            scheduler=scheduler,
-            rank=rank,
-            device=device,
-        )
-    else:
-        if rank == 0:
-            print("Not resuming from checkpoint, starting from scratch.")
+    _, _, _, _ = load_checkpoint(
+        ckpt_path=ckpt_path,
+        enc=enc,
+        dec=dec,
+        rms_norm=rms_norm,
+        rank=rank,
+        device=device,
+    )
 
     # TensorBoard + wandb (rank 0 only)
     if rank == 0:
         # Use stable log_dir if resuming, otherwise create new one
-        if log_dir is None:
-            now = datetime.datetime.now()
-            log_dir = f"./logs/dreamer_v4_dynamics/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
-            os.makedirs(log_dir, exist_ok=True)
-            ckpt_path = os.path.join(log_dir, "latest.pt")
-        else:
-            # Resuming: reuse existing log_dir
-            print(f"Reusing log directory: {log_dir}")
+        now = datetime.datetime.now()
+        log_dir = f"./logs/dreamer_v4_tokenizer/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
+        os.makedirs(log_dir, exist_ok=True)
+        ckpt_path = os.path.join(log_dir, "latest.pt")
 
         tb_log_dir = os.path.join(log_dir, "tensorboard")
         os.makedirs(tb_log_dir, exist_ok=True)
 
-        # Initialize W&B with resume logic
-        if wandb_run_id is not None:
-            # Resuming an existing run
-            wandb.init(
-                project="dreamer-v4-tokenizer",
-                id=wandb_run_id,
-                resume="must",  # or "must" if you want to error if run doesn't exist
-                config={
-                    "img_h": IMG_H,
-                    "img_w": IMG_W,
-                    "context_t": CONTEXT_T,
-                    "n_latents": N_LATENTS,
-                    "bottleneck_d": BOTTLENECK_D,
-                    "d_model": D_MODEL,
-                    "n_layers": N_LAYERS,
-                    "heads_q": HEADS_Q,
-                    "heads_kv_latent": HEADS_KV_LATENT,
-                    "mlp_ratio": MLP_RATIO,
-                    "temporal_every": TEMPORAL_EVERY,
-                    "batch_per_gpu": BATCH_PER_GPU,
-                    "grad_accum_steps": GRAD_ACCUM_STEPS,
-                    "lr": 1e-4,
-                    "weight_decay": 0.01,
-                    "use_compile": USE_COMPILE,
-                },
-                sync_tensorboard=True,
-                dir=log_dir,
-            )
-        else:
+        # Initialize W&B
+        if True:
             # Starting a new run
             wandb.init(
                 project="dreamer-v4-tokenizer",
-                name=f"run_nodes{world_size//8}_gpus{world_size}",
+                name=f"finetune_run_nodes{world_size//8}_gpus{world_size}",
                 config={
                     "img_h": IMG_H,
                     "img_w": IMG_W,
@@ -752,7 +531,8 @@ def main():
 
     for epoch in range(start_epoch, NUM_EPOCHS):
         # --- TRAIN PHASE ---
-        dyn.train()
+        enc.train()
+        dec.train()
 
         # CRITICAL: Set epoch for DistributedSampler to reshuffle data
         train_sampler.set_epoch(epoch)
@@ -766,9 +546,10 @@ def main():
         num_updates = 0
 
         # Accumulators over the current accumulation window
-        accum_flow = 0.0
-        accum_shortcut = 0.0
-        accum_total = 0.0
+        accum_mse = 0.0
+        accum_lpips = 0.0
+        accum_raw_loss = 0.0  # mse + 0.2 * lpips
+        accum_norm = 0.0
 
         for step_idx, batch in enumerate(train_loader):
             #if step_idx > STEPS_PER_EPOCH:
@@ -798,62 +579,86 @@ def main():
             if micro_idx == 0:
                 optim.zero_grad(set_to_none=True)
 
-            # Encode (Frozen)
-            with torch.no_grad():
-                _, _, z_clean = enc(images)
+            P_enc, L_enc, Z = enc(images)
+            R_dec, x_hat = dec(Z)
 
-            B, T, _, _ = z_clean.shape
+            # --- Tokenizer reconstruction losses: MSE + 0.2 * LPIPS, with RMS normalization ---
 
-            tau_vals, d_vals, tau_idxs, step_idxs = sample_shortcut_batch(
-                B, T, device, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels=NUM_TAU_LEVELS
-            )
+            # 1) Pixel MSE in the native scale of your data
+            mse_loss = nn.functional.mse_loss(x_hat, images)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss, l_flow, l_short = compute_dynamics_loss(
-                    dyn, actions, z_clean,
-                    tau_vals, d_vals, tau_idxs, step_idxs, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels=NUM_TAU_LEVELS
-                )
+                # 2) LPIPS perceptual loss expects images in [-1, 1]
+                images_lpips = (images * 2.0) - 1.0          # [B, T, C, H, W] -> [-1,1]
+                x_hat_lpips = (x_hat * 2.0) - 1.0
+
+                # LPIPS implementation expects shape [B', C, H, W]; flatten time into batch
+                B, T, C, H, W = images_lpips.shape
+                images_lpips_flat = images_lpips.view(B * T, C, H, W)
+                x_hat_lpips_flat = x_hat_lpips.view(B * T, C, H, W)
+
+                lpips_val = lpips_model(x_hat_lpips_flat, images_lpips_flat)
+                # Some LPIPS implementations return shape [B']; take mean over batch
+                lpips_loss = lpips_val.mean()
+
+            # Pre-RMS total loss (for logging only): L_raw = mse + 0.2 * lpips
+            raw_loss = mse_loss + 0.2 * lpips_loss
 
             # Update accumulators (CPU scalars)
-            accum_flow += l_flow
-            accum_shortcut += l_short
-            accum_total += loss.detach().item()
+            accum_mse += mse_loss.detach().item()
+            accum_lpips += lpips_loss.detach().item()
+            accum_raw_loss += raw_loss.detach().item()
 
-            loss = loss / GRAD_ACCUM_STEPS
+            # 3) RMS loss normalization per term
+            mse_norm = rms_norm("mse", mse_loss)
+            lpips_norm = rms_norm("lpips", lpips_loss)
+
+            # 4) Combined tokenizer loss: L = LMSE + 0.2 * LLPIPS
+            loss = (mse_norm + 0.2 * lpips_norm) / GRAD_ACCUM_STEPS
+            accum_norm = accum_norm + loss.detach().item()
+
+            # Backward pass
             loss.backward()
 
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
-                dyn.clip_grad_norm_(1.0)
+                #torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                enc.clip_grad_norm_(max_norm=1.0)
+                dec.clip_grad_norm_(max_norm=1.0)
 
                 optim.step()
                 scheduler.step()
                 global_update += 1
 
-                total_mean = torch.tensor([accum_total], device=device)
-                dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)   # average across ranks
-                sync_loss = total_mean.item()
+                norm_mean = torch.tensor([accum_norm], device=device)
+                dist.all_reduce(norm_mean, op=dist.ReduceOp.AVG)   # average across ranks
+                sync_loss = norm_mean.item()
                 epoch_loss_sum += sync_loss
                 num_updates += 1
 
                 # sums over accumulation window on this rank
-                flow_sum = torch.tensor([accum_flow], device=device)
-                short_sum = torch.tensor([accum_shortcut], device=device)
+                mse_sum = torch.tensor([accum_mse], device=device)
+                lpips_sum = torch.tensor([accum_lpips], device=device)
+                raw_sum = torch.tensor([accum_raw_loss], device=device)
 
-                dist.all_reduce(flow_sum, op=dist.ReduceOp.AVG)
-                dist.all_reduce(short_sum, op=dist.ReduceOp.AVG)
+                dist.all_reduce(mse_sum, op=dist.ReduceOp.AVG)
+                dist.all_reduce(lpips_sum, op=dist.ReduceOp.AVG)
+                dist.all_reduce(raw_sum, op=dist.ReduceOp.AVG)
 
-                flow_sum = flow_sum.item()
-                short_sum = short_sum.item()
+                mse_sum = mse_sum.item()
+                lpips_sum = lpips_sum.item()
+                raw_sum = raw_sum.item()
 
-                flow_mean = flow_sum / GRAD_ACCUM_STEPS
-                short_mean = short_sum / GRAD_ACCUM_STEPS
+                mse_mean = mse_sum / GRAD_ACCUM_STEPS
+                lpips_mean = lpips_sum / GRAD_ACCUM_STEPS
+                raw_mean = raw_sum / GRAD_ACCUM_STEPS
 
                 if rank == 0:
                     # Sums over micro-batches in this update
-                    tb_writer.add_scalar("train/flow_loss_mean", flow_mean, global_update)
-                    tb_writer.add_scalar("train/shortcut_loss_mean", short_mean, global_update)
-                    tb_writer.add_scalar("train/total_loss_mean", sync_loss, global_update)
+                    tb_writer.add_scalar("train/mse_mean", mse_mean, global_update)
+                    tb_writer.add_scalar("train/lpips_mean", lpips_mean, global_update)
+                    tb_writer.add_scalar("train/raw_loss_mean", raw_mean, global_update)
+                    tb_writer.add_scalar("train/normalized_loss_mean", sync_loss, global_update)
                     current_lr = scheduler.get_last_lr()[0]
                     tb_writer.add_scalar("train/lr", current_lr, global_update)
 
@@ -865,18 +670,21 @@ def main():
                         ckpt_path=ckpt_path,
                         epoch=epoch,
                         global_update=global_update,
-                        dyn=dyn,
+                        enc=enc,
+                        dec=dec,
                         optim=optim,
                         scheduler=scheduler,
+                        rms_norm=rms_norm,
                         rank=rank,
                         wandb_run_id=wandb_run_id,
                         log_dir=log_dir,
                     )
 
                 # Reset accumulators for next accumulation window
-                accum_flow = 0.0
-                accum_shortcut = 0.0
-                accum_total = 0.0
+                accum_mse = 0.0
+                accum_lpips = 0.0
+                accum_raw_loss = 0.0
+                accum_norm = 0.0
 
             torch.cuda.synchronize(device)
             step_end = time.perf_counter()
@@ -891,7 +699,7 @@ def main():
                 avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
                 avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
-                frames_per_step = BATCH_PER_GPU * CONTEXT_T_DYN * world_size
+                frames_per_step = BATCH_PER_GPU * CONTEXT_T * world_size
                 step_fps = frames_per_step / avg_step_time
                 data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
@@ -908,7 +716,7 @@ def main():
 
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
-        total_frames = BATCH_PER_GPU * CONTEXT_T_DYN * world_size * STEPS_PER_EPOCH
+        total_frames = BATCH_PER_GPU * CONTEXT_T * world_size * STEPS_PER_EPOCH
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 
@@ -932,9 +740,11 @@ def main():
             ckpt_path=ckpt_path,
             epoch=epoch,
             global_update=global_update,
-            dyn=dyn,
+            enc=enc,
+            dec=dec,
             optim=optim,
             scheduler=scheduler,
+            rms_norm=rms_norm,
             rank=rank,
             wandb_run_id=wandb_run_id,
             log_dir=log_dir,

@@ -1,17 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=dreamer_v4_multinode
-#SBATCH --nodes=3                          # 2 nodes
-#SBATCH --ntasks-per-node=8                # 8 tasks (GPUs) per node
-#SBATCH --gres=gpu:8                       # 8 GPUs per node
+#SBATCH --nodes=1                          # 2 nodes
+#SBATCH --ntasks-per-node=4                # 8 tasks (GPUs) per node
+#SBATCH --gres=gpu:4                       # 8 GPUs per node
 #SBATCH --constraint='h200'
 #SBATCH --cpus-per-task=16                 # CPU cores per GPU
 #SBATCH --mem=0                            # Request all memory on node
-#SBATCH --time=01:00:00                    # Max runtime
+#SBATCH --time=48:00:00                    # Max runtime
 #SBATCH --output=logs/dreamer_%j.out       # Output log
 #SBATCH --error=logs/dreamer_%j.err        # Error log
-#SBATCH --exclusive
-#SBATCH --comment="preemption=yes;requeue=true"
 #SBATCH --account torch_pr_155_tandon_advanced
+
+# --exclusive
+#torch_pr_43_tandon_advanced
+#torch_pr_155_tandon_advanced
 
 # Create logs directory
 mkdir -p logs
@@ -56,7 +58,7 @@ srun singularity exec --nv \
     /bin/bash -c "
         source /ext3/env.sh
         conda activate dmo_dreamer_diffusion
-        debug_train_dreamer_dynamics_fsdp.py
+        python go2_train_dreamer_dynamics_ddp.py
     "
 
 echo "Training completed!"

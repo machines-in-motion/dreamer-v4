@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=dreamer_v4_multinode
-#SBATCH --nodes=16                          # 2 nodes
+#SBATCH --nodes=3                          # 2 nodes
 #SBATCH --ntasks-per-node=4                # 8 tasks (GPUs) per node
-#SBATCH --gres=gpu:4                       # 8 GPUs per node
+#SBATCH --gres=gpu:8                       # 8 GPUs per node
 #SBATCH --constraint='h100'
 #SBATCH --cpus-per-task=24                 # CPU cores per GPU
 #SBATCH --time=07:00:00                    # Max runtime

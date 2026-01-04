@@ -3,17 +3,6 @@ import time
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
-)
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    ShardingStrategy,
-    MixedPrecision,
-    BackwardPrefetch,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
@@ -32,49 +21,36 @@ import datetime
 import math
 from datetime import timedelta
 import numpy as np
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 def save_checkpoint(
     ckpt_path: str,
     epoch: int,
     global_update: int,
-    dyn: FSDP,
+    dyn: DDP,
     optim: torch.optim.Optimizer,
     scheduler,
     rank: int,
     wandb_run_id: str = None,
     log_dir: str = None,
 ):
-    """
-    Save a FULL checkpoint (unsharded enc/dec) on rank 0.
-    ALL RANKS must call this function for FSDP collectives to work.
-    """
-    # Gather full (unsharded) state dicts on CPU
-    # ALL RANKS must participate in this, even though only rank 0 gets the result
-    full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-
-    with FSDP.state_dict_type(dyn, StateDictType.FULL_STATE_DICT, full_cfg):
-        dyn_state = dyn.state_dict()  # All ranks participate in gather
-
-    # Only rank 0 saves to disk
     if rank == 0:
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        
         ckpt = {
             "epoch": epoch,
             "global_update": global_update,
-            "dyn": dyn_state,
+            "dyn": dyn.module.state_dict(),  # <- .module to unwrap DDP
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
             "wandb_run_id": wandb_run_id,
             "log_dir": log_dir,
         }
-
         torch.save(ckpt, ckpt_path)
         print(f"[rank0] Saved checkpoint to {ckpt_path}")
 
 def load_checkpoint(
     ckpt_path: str,
-    dyn: FSDP,
+    dyn: DDP,
     optim: torch.optim.Optimizer,
     scheduler,
     rank: int,
@@ -106,11 +82,7 @@ def load_checkpoint(
     wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
     log_dir = ckpt.get("log_dir", None)            # NEW
 
-    # Load full enc/dec state dicts into FSDP models
-    full_cfg = FullStateDictConfig(rank0_only=False, offload_to_cpu=True)
-
-    with FSDP.state_dict_type(dyn, StateDictType.FULL_STATE_DICT, full_cfg):
-        dyn.load_state_dict(ckpt["dyn"])
+    dyn.module.load_state_dict(ckpt["dyn"])
 
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])
@@ -155,53 +127,6 @@ def cleanup_distributed():
     """Clean up distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
-
-def get_fsdp_wrap_policy():
-    """Define which layers to wrap with FSDP."""
-    return partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            BlockCausalDynamicsLayer,
-            BlockCausalEncoderLayer
-        },
-    )
-
-def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD",
-                     fp32_params=False):
-    """Wrap model with FSDP for distributed training."""
-    if mixed_precision:
-        if fp32_params:
-            mp_policy = MixedPrecision(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat32,
-            )
-        else:
-            mp_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
-    else:
-        mp_policy = None
-
-    strategy_map = {
-        "FULL_SHARD": ShardingStrategy.FULL_SHARD,
-        "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
-        "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
-    }
-
-    fsdp_model = FSDP(
-        model,
-        sharding_strategy=strategy_map[sharding_strategy],
-        auto_wrap_policy=get_fsdp_wrap_policy(),
-        mixed_precision=mp_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        device_id=torch.cuda.current_device(),
-        limit_all_gathers=True,
-        use_orig_params=True,
-    )
-    return fsdp_model
 
 def create_distributed_dataloader(
     data_dir: str,
@@ -413,6 +338,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
         # We assume the WHOLE batch on this GPU is shortcut data 
 
         with torch.no_grad():
+            inner_model = dyn_model.module if hasattr(dyn_model, "module") else dyn_model
             # Calculate Next Half-Step Params
             # d_half = d / 2
             d_half = d_vals / 2.0
@@ -426,7 +352,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
 
             # --- Teacher 1: Start -> Middle ---
             # Pred z1 from (z_tau, tau, d/2)
-            pred_z1_t1 = dyn_model(
+            pred_z1_t1 = inner_model(
                 actions,
                 z_in_short,
                 tau_idxs_1,
@@ -448,7 +374,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
             # New unique ID for (tau + d/2)
             tau_idxs_2 = tau_idxs_1 - (2 ** (d_min_idx - step_idxs_half)).long()
 
-            pred_z1_t2 = dyn_model(
+            pred_z1_t2 = inner_model(
                 actions,
                 z_prime,
                 tau_idxs_2,
@@ -509,20 +435,19 @@ def main():
     NUM_TAU_LEVELS = 128
     NUM_REGISTERS = 4
 
-    D_MODEL_DYN = 1024 # 2048
-    N_LAYERS_DYN = 16 # 32
-    HEADS_Q_DYN = 16 # 32
+    D_MODEL_DYN = 2048
+    N_LAYERS_DYN = 32
+    HEADS_Q_DYN = 32
     CONTEXT_T_DYN = 32 # 96
 
     # Tokenizer checkpoint (encoder-only used, frozen)
-    #TOKENIZER_CKPT = "./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt"  # path to a saved tokenizer ckpt
     TOKENIZER_CKPT = "./logs/dreamer_v4_tokenizer/2025-11-26_15-52-05/latest.pt"  # path to a saved tokenizer ckpt
 
     # Batch size per GPU
     BATCH_PER_GPU = 1
     T = CONTEXT_T_DYN
-    NUM_EPOCHS = 30 # 65
-    #STEPS_PER_EPOCH = 20  # Limit steps per epoch for faster benchmarking
+    NUM_EPOCHS = 30
+    #STEPS_PER_EPOCH = 20 # Limit steps per epoch for faster benchmarking
     GRAD_ACCUM_STEPS = 10 # 10  # simulate batch size 10 per GPU
     effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
     if rank == 0:
@@ -614,14 +539,16 @@ def main():
 
     #enc = setup_fsdp_model(enc, mixed_precision=True, sharding_strategy="FULL_SHARD")
     enc = enc.to(torch.bfloat16)
+
+    if USE_COMPILE:
+        #dyn = torch.compile(dyn, mode="max-autotune", fullgraph=False)
+        dyn = torch.compile(dyn, mode="max-autotune-no-cudagraphs", fullgraph=False)
     # dynamics: FP32 params to avoid BF16-param / FP32-grad bug
-    dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="FULL_SHARD",
-                       fp32_params=False)
     #dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="FULL_SHARD",
     #                   fp32_params=True)
-
-    #if USE_COMPILE:
-    #    dyn = torch.compile(dyn, mode="max-autotune-no-cudagraphs", fullgraph=False)
+    #dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="SHARD_GRAD_OP",
+    #                   fp32_params=True)
+    dyn = DDP(dyn, device_ids=[local_rank], find_unused_parameters=False)
 
     # Create optimizer
     optim = torch.optim.AdamW(dyn.parameters(), lr=1e-4, weight_decay=0.1)
@@ -632,10 +559,10 @@ def main():
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
-    RESUME_TRAINING = False
+    RESUME_TRAINING = True
     wandb_run_id = None
     log_dir = None
-    ckpt_path = None
+    ckpt_path = "./logs/dreamer_v4_dynamics/2025-11-30_08-05-07/latest.pt"
     start_epoch = 0
     global_update = 0  # counts optimizer updates
     if RESUME_TRAINING:
@@ -802,6 +729,8 @@ def main():
             with torch.no_grad():
                 _, _, z_clean = enc(images)
 
+            z_clean = z_clean.clone()
+
             B, T, _, _ = z_clean.shape
 
             tau_vals, d_vals, tau_idxs, step_idxs = sample_shortcut_batch(
@@ -824,7 +753,7 @@ def main():
 
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
-                dyn.clip_grad_norm_(1.0)
+                torch.nn.utils.clip_grad_norm_(dyn.parameters(), max_norm=1.0)
 
                 optim.step()
                 scheduler.step()

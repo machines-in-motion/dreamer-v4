@@ -55,7 +55,9 @@ srun singularity exec --nv \
     /bin/bash -c "
         source /ext3/env.sh
         conda activate dmo_dreamer_diffusion
-        python debug_train_dreamer_fsdp.py
+        python go2_train_dreamer_tokenizer_fsdp.py
     "
+
+# debug_train_dreamer_fsdp.py
 
 echo "Training completed!"

@@ -9,13 +9,13 @@ import torchvision.transforms.functional as TF
 
 # Import models and dataset
 from models import DreamerV4Encoder, DreamerV4Decoder, DreamerV4Dynamics
-from dataset import ShardedHDF5Dataset
+from dataset import ShardedHDF5Dataset, HDF5SequenceDataset
 
 # --- Configuration (Matches Training) ---
-IMG_H, IMG_W = 256, 256
+IMG_H, IMG_W = 128, 128 # 256, 256
 PATCH = 16
 CONTEXT_T = 96
-N_LATENTS = 512
+N_LATENTS = 256 # 512
 BOTTLENECK_D = 16
 D_MODEL_ENC = 768
 N_LAYERS_ENC = 12
@@ -32,11 +32,14 @@ NUM_REGISTERS = 4
 NUM_TAU_LEVELS = 128
 CONTEXT_T_DYN = 32
 
+SEQ_COR_TAU_IDX = 12
+SEQ_COR = True
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer_ckpt", type=str, required=True, help="Path to tokenizer checkpoint")
     parser.add_argument("--dynamics_ckpt", type=str, required=True, help="Path to dynamics checkpoint")
-    parser.add_argument("--data_dir", type=str, default="/lustre/fswork/projects/rech/ugb/uzp81xx/soar_data_sharded/", help="Path to dataset")
+    parser.add_argument("--data_dir", type=str, default="/scratch/ja5009/soar_data_sharded_128x128/", help="Path to dataset")
     parser.add_argument("--output_dir", type=str, default="./eval_results", help="Directory to save results")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of trajectories to evaluate")
     parser.add_argument("--context_len", type=int, default=10, help="Number of conditioning frames")
@@ -84,7 +87,7 @@ def load_dynamics(ckpt_path, action_dim, device):
         num_registers=NUM_REGISTERS, seq_len=CONTEXT_T_DYN, num_tau_levels=NUM_TAU_LEVELS,
         temporal_every=TEMPORAL_EVERY
     ).to(device, dtype=torch.bfloat16).eval()
-    #dyn = torch.compile(dyn)
+    dyn = torch.compile(dyn)
     
     # Load weights (Standard FSDP FULL_STATE_DICT save is compatible with standard load)
     dyn.load_state_dict(ckpt["dyn"])
@@ -121,7 +124,7 @@ def euler_solve_step(model, actions_seq, z_seq, t_idx, device, num_steps=4):
 
         # Create index tensors
         tau_idxs = torch.zeros(B, t_idx+1, dtype=torch.long, device=device)
-        tau_idxs[:, :t_idx] = 0 # History is clean
+        tau_idxs[:, :t_idx] = SEQ_COR_TAU_IDX if SEQ_COR else 0 # Slitghly corrupt history
         tau_idxs[:, t_idx] = curr_tau_idx # Current frame is at tau_curr
 
         step_idxs = torch.full((B, t_idx+1), d_min_idx, dtype=torch.long, device=device)
@@ -170,12 +173,15 @@ def main():
     
     # 1. Load Data
     print(f"Setting up dataset from {args.data_dir}...")
-    dataset = ShardedHDF5Dataset(
+    """dataset = ShardedHDF5Dataset(
         data_dir=args.data_dir, window_size=CONTEXT_T_DYN, stride=1, split="test",
         train_fraction=0.9, split_seed=123
-    )
+    )"""
+    dataset = HDF5SequenceDataset(data_dir=args.data_dir, window_size=CONTEXT_T_DYN, stride=1)
     # Standard DataLoader (no distributed sampler needed for eval)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.num_samples, shuffle=False)
+    g = torch.Generator()
+    g.manual_seed(42)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.num_samples, shuffle=True, generator=g)
     
     # Fetch one batch
     batch = next(iter(dataloader))
@@ -200,7 +206,17 @@ def main():
     # 4. Autoregressive Generation
     print(f"Starting generation (Context={args.context_len})...")
     z_gen = z_gt.clone()
-    
+    final_z_gen = z_gt.clone()
+
+    t_idx = args.context_len
+    if SEQ_COR:
+        SEQ_COR_TAU = torch.zeros(B, t_idx, dtype=torch.bfloat16, device=args.device)
+        SEQ_COR_TAU.fill_(1. - ((SEQ_COR_TAU_IDX + 1) / NUM_TAU_LEVELS))
+        eps = torch.randn_like(z_gen[:, :t_idx])
+        # tau shape (B,T) -> (B,T,1,1)
+        tau_ex = SEQ_COR_TAU.view(B, t_idx, 1, 1)
+        z_gen[:, :t_idx] = (1 - tau_ex) * eps + tau_ex * z_gen[:, :t_idx]
+
     # We keep the first `context_len` frames fixed, generate the rest
     for t in range(args.context_len, T):
         print(f"Generating frame {t+1}/{T}...")
@@ -208,6 +224,14 @@ def main():
             # Generate frame t conditioned on 0..t-1
             z_next = euler_solve_step(dyn, actions, z_gen, t, args.device, num_steps=4)
             z_gen[:, t:t+1] = z_next
+            final_z_gen[:, t:t+1] = z_next.clone()
+
+            if SEQ_COR:
+                SEQ_COR_TAU = torch.zeros(B, 1, dtype=torch.bfloat16, device=args.device)
+                SEQ_COR_TAU.fill_(1. - ((SEQ_COR_TAU_IDX + 1) / NUM_TAU_LEVELS))
+                eps = torch.randn_like(z_gen[:, t:t+1])
+                tau_ex = SEQ_COR_TAU.view(B, 1, 1, 1)
+                z_gen[:, t:t+1] = (1 - tau_ex) * eps + tau_ex * z_gen[:, t:t+1]
             
     # 5. Decode and Visualize
     print("Decoding trajectories...")
@@ -217,7 +241,7 @@ def main():
         recon_gt = recon_gt.to(torch.float32)
         
         # Decode Generated
-        _, recon_gen = dec(z_gen)
+        _, recon_gen = dec(final_z_gen)
         recon_gen = recon_gen.to(torch.float32)
         
     # 6. Save Grids

@@ -1,9 +1,9 @@
 #!/bin/bash
-input_dir="../soar_data_sharded"
-output_dir="../soar_data_sharded_128x128"
+input_dir="/scratch/ja5009/soar_data_sharded"
+output_dir="/scratch/ja5009/soar_data_sharded_128x128"
 target_size="128 128"
 num_shards=62  # Adjust if needed
-n_procs=32
+n_procs=62
 shards_per_proc=$(( (num_shards + n_procs - 1) / n_procs ))  # Ceiling division
 
 for i in $(seq 0 $((n_procs-1))); do

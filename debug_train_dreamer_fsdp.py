@@ -1,4 +1,3 @@
-import idr_torch
 import os
 import time
 import torch
@@ -173,8 +172,6 @@ def setup_distributed():
     Initialize distributed process group using SLURM environment variables.
     SLURM sets these automatically when using srun with --ntasks-per-node.
     """
-    rank = idr_torch.rank
-
     # SLURM sets these environment variables automatically
     rank = int(os.environ['SLURM_PROCID'])           # Global rank
     local_rank = int(os.environ['SLURM_LOCALID'])    # Local rank on node
@@ -366,8 +363,8 @@ def main():
     # Batch size per GPU
     BATCH_PER_GPU = 2 # 1
     T = CONTEXT_T
-    NUM_EPOCHS = 3 # 65
-    STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
+    NUM_EPOCHS = 65
+    #STEPS_PER_EPOCH = 100  # Limit steps per epoch for faster benchmarking
     GRAD_ACCUM_STEPS = 5 # 10  # simulate batch size 10 per GPU
     effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
     if rank == 0:
@@ -433,7 +430,7 @@ def main():
         print("Wrapping models with FSDP...")
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
-        data_dir="/lustre/fswork/projects/rech/ugb/uzp81xx/soar_data_sharded_128x128/",
+        data_dir="/scratch/ja5009/soar_data_sharded_128x128/",
         window_size=CONTEXT_T,
         batch_size=BATCH_PER_GPU,
         rank=rank,
@@ -449,7 +446,7 @@ def main():
     )
 
     test_loader, test_sampler, test_dataset = create_distributed_dataloader(
-        data_dir="/lustre/fswork/projects/rech/ugb/uzp81xx/soar_data_sharded_128x128/",
+        data_dir="/scratch/ja5009/soar_data_sharded_128x128/",
         window_size=CONTEXT_T,
         batch_size=BATCH_PER_GPU,
         rank=rank,
@@ -472,7 +469,7 @@ def main():
     optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01) # try increasing to 0.03–0.05? (apparently normal range for tokenizer)
 
     steps_per_epoch = len(train_loader)
-    #STEPS_PER_EPOCH = steps_per_epoch
+    STEPS_PER_EPOCH = steps_per_epoch
     total_steps = NUM_EPOCHS * steps_per_epoch // GRAD_ACCUM_STEPS
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
@@ -623,8 +620,8 @@ def main():
         accum_norm = 0.0
 
         for step_idx, batch in enumerate(train_loader):
-            if step_idx > STEPS_PER_EPOCH:
-                break
+            #if step_idx > STEPS_PER_EPOCH:
+            #    break
             micro_idx = step_idx % GRAD_ACCUM_STEPS
             is_last_micro = (micro_idx == GRAD_ACCUM_STEPS - 1)
 
@@ -811,8 +808,8 @@ def main():
 
         with torch.no_grad():
             for step_idx, batch in enumerate(test_loader):
-                if step_idx > STEPS_PER_EPOCH:
-                    break
+                #if step_idx > STEPS_PER_EPOCH:
+                #    break
                 images = batch['image'].to(device, non_blocking=True).to(torch.bfloat16)
                 actions = batch['action'].to(device, non_blocking=True).to(torch.bfloat16)
 

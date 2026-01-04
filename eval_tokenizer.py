@@ -10,7 +10,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from models import DreamerV4Encoder, DreamerV4Decoder
-from dataset import ShardedHDF5Dataset
+from dataset import ShardedHDF5Dataset, HDF5SequenceDataset
 from torch.utils.data import DataLoader
 import numpy as np
 import h5py
@@ -34,10 +34,10 @@ def load_checkpoint_for_eval(ckpt_path, device):
     print(f"Global update: {ckpt.get('global_update', 'unknown')}")
     
     # Model hyperparameters (must match training config)
-    IMG_H, IMG_W = 256, 256
+    IMG_H, IMG_W = 128, 128 # 256, 256
     PATCH = 16
     CONTEXT_T = 96
-    N_LATENTS = 512
+    N_LATENTS = 256 # 512
     BOTTLENECK_D = 16
     D_MODEL = 768
     N_LAYERS = 12
@@ -87,8 +87,8 @@ def load_checkpoint_for_eval(ckpt_path, device):
 
     if USE_COMPILE:
         # Good starting config; you can try other modes later
-        enc = torch.compile(enc, mode="max-autotune", fullgraph=False)
-        dec = torch.compile(dec, mode="max-autotune", fullgraph=False)
+        enc = torch.compile(enc) #, mode="max-autotune", fullgraph=False)
+        dec = torch.compile(dec) #, mode="max-autotune", fullgraph=False)
 
     # Load state dicts
     enc.load_state_dict(ckpt["enc"])
@@ -436,6 +436,38 @@ def mask_video_with_patch_mask(
 
     return masked_video
 
+def plot_latent_histogram(latents, save_path, title="Latent Distribution"):
+    """
+    Plots a histogram of the latent values (flattened).
+    Args:
+        latents: Tensor [B, T, N, D]
+        save_path: Path to save the plot
+    """
+    # Detach, move to CPU, convert to float32 (for matplotlib), and flatten
+    data = latents.detach().to(torch.float32).cpu().numpy().flatten()
+    
+    mu = data.mean()
+    sigma = data.std()
+    
+    plt.figure(figsize=(8, 6))
+    # Use 100 bins for granularity
+    n, bins, patches = plt.hist(data, bins=100, color='teal', alpha=0.7, density=True)
+    
+    # Add a Gaussian fit line for reference (optional, helps check normality)
+    y = ((1 / (np.sqrt(2 * np.pi) * sigma)) *
+         np.exp(-0.5 * (1 / sigma * (bins - mu))**2))
+    plt.plot(bins, y, '--', color='orange', label='Normal Dist')
+
+    plt.title(f"{title}\nMean: {mu:.4f}, Std: {sigma:.4f}, Min: {data.min():.2f}, Max: {data.max():.2f}")
+    plt.xlabel("Value")
+    plt.ylabel("Density")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100)
+    plt.close()
+
 def evaluate_trajectories(
     ckpt_path,
     data_dir,
@@ -473,12 +505,18 @@ def evaluate_trajectories(
         split_seed=123,
     )"""
 
-    test_dataset = PushTDatasetClass(
+    test_dataset = HDF5SequenceDataset(
+        data_dir=data_dir,
+        window_size=CONTEXT_T,
+        stride=CONTEXT_T,  # Non-overlapping windows for diverse samples
+    )
+
+    """test_dataset = PushTDatasetClass(
         hd5_file_path='/scratch/ja5009/dataset/pusht-hd5-v1-224/episode_0.h5',
         window_size=CONTEXT_T,
         stride=CONTEXT_T,  # Non-overlapping windows for diverse samples
         load_to_ram=True
-    )
+    )"""
 
     """test_dataset = Places365SingleImageDataset(
         root='/scratch/ja5009/data/places365',
@@ -509,6 +547,12 @@ def evaluate_trajectories(
             mask = make_right_rect_mask_for_last_n_frames(images, patch_size=16, n_frames=6)
             P_enc, L_enc, Z, mask = enc(images, mask=mask)
             Z = Z.clone()  # Prevents CUDA graph memory reuse conflict
+            Z_clean = Z.clone()
+
+            #z_t = torch.randn_like(Z) # B, T, N, D
+            #tau = 1. - (traj_idx + 1) / num_trajectories # signal level, clean = 1.
+            #Z = tau * Z + (1 - tau) * z_t
+
             mask = mask.clone()
             R_dec, x_hat = dec(Z)
 
@@ -528,7 +572,7 @@ def evaluate_trajectories(
             )
 
             original = images[0]  # [T, C, H, W]
-            reconstructed = x_hat[0]  # [T, C, H, W]
+            reconstructed = torch.clamp(x_hat[0], 0, 1)  # [T, C, H, W]
 
             # Compute metrics
             mse = nn.functional.mse_loss(reconstructed, original).item()
@@ -536,6 +580,14 @@ def evaluate_trajectories(
             print(f"Trajectory {traj_idx + 1}/{num_trajectories}")
             print(f"  MSE: {mse:.6f}")
             print(f"  Latent bottleneck shape: {Z.shape}")
+
+            hist_path = output_dir / f"trajectory_{traj_idx:03d}_hist.png"
+            plot_latent_histogram(
+                Z_clean, 
+                hist_path, 
+                title=f"Latent Dist Traj {traj_idx}"
+            )
+            print(f"  Saved histogram to {hist_path}")
 
             # Save comparison image
             save_path = output_dir / f"trajectory_{traj_idx:03d}_comparison.png"
@@ -553,9 +605,12 @@ def main():
     Main evaluation script.
     """
     # Configuration
-    CHECKPOINT_PATH = "./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt"
-    DATA_DIR = "/scratch/ja5009/soar_data_sharded/"
-    OUTPUT_DIR = "./eval_outputs"
+    #CHECKPOINT_PATH = "./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt"
+    #CHECKPOINT_PATH = "./logs/dreamer_v4_tokenizer/2025-12-27_16-15-06/latest.pt"
+    CHECKPOINT_PATH = "./logs/dreamer_v4_tokenizer/2025-12-31_11-10-46/latest.pt"
+    #DATA_DIR = "/scratch/ja5009/soar_data_sharded_128x128/"
+    DATA_DIR = "/scratch/ja5009/processed_logs/"
+    OUTPUT_DIR = "./eval_outputs_128x128"
     NUM_TRAJECTORIES = 32
     NUM_FRAMES_PER_TRAJ = 32
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
