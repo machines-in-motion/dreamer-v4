@@ -6,34 +6,11 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Tuple, Optional, List
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from .utils import create_encoder_spatial_mask, create_decoder_spatial_mask, create_temporal_mask
 
-
-def create_temporal_mask(T: int, device: str = "cpu") -> torch.Tensor:
-    """
-    Standard causal mask for attention:
-      mask[q, k] = True  -> allowed (k <= q)
-      mask[q, k] = False -> masked out (k > q)
-    Shape: (T, T)
-    """
-    # Lower-triangular (including diagonal) is True
-    arange = torch.arange(T, device=device)
-    mask = arange.view(T, 1) >= arange.view(1, T)  # (q >= k)
-    return mask  # dtype=bool, shape (T, T)
-
-def create_encoder_spatial_mask(N_patch, N_latent, device="cpu"):
-    S = N_patch + N_latent
-    mask = torch.zeros(S, S, dtype=torch.bool, device=device)
-    mask[0:N_patch, 0:N_patch] = True
-    mask[N_patch:S, 0:] = True
-    return mask
-
-def create_decoder_spatial_mask(N_patch, N_latent, device="cpu"):
-    S = N_patch + N_latent
-    mask = torch.zeros(S, S, dtype=torch.bool, device=device)
-    mask[0:N_patch, 0:] = True
-    mask[N_patch:, N_patch:] = True
-    return mask
-
+class LayerType(Enum):
+    SPATIAL = "spatial"
+    TEMPORAL = "temporal"
 
 class FeedForwardSwiGLU(nn.Module):
     """
@@ -212,7 +189,6 @@ class Attention(nn.Module):
         Y = self.W_o(Y)
         return Y
 
-
 class AxialAttention(nn.Module):
     """
     Axial wrapper around the Attention block.
@@ -295,10 +271,6 @@ class AxialAttention(nn.Module):
         Y_t = Y_flat.view(*q_t.shape)  # (B, d1, ..., d_{dim-1}, d_{dim+1}, ..., dN, Tq, D)
         Y = Y_t.transpose(dim, -2).contiguous()  # (B, d1, ..., dN, D)
         return Y
-
-class LayerType(Enum):
-    SPATIAL = "spatial"
-    TEMPORAL = "temporal"
 
 class EfficientTransformerLayer(nn.Module):
     """
@@ -428,3 +400,22 @@ class EfficientTransformerBlock(nn.Module):
             )
 
         return x
+    
+class DiscreteEmbedder(nn.Module):
+    def __init__(self, n_states, n_dim):
+        super().__init__()
+        self.n_states = n_states
+
+        # (n_states, n_dim) — each row = embedding for one discrete state
+        self.embeddings = nn.Parameter(torch.zeros(n_states, n_dim))
+
+        # good idea: initialize like nn.Embedding
+        nn.init.normal_(self.embeddings, std=0.02)
+
+    def forward(self, x):
+        """
+        x: LongTensor of shape (B,) or (B, T) containing indices in [0, n_states)
+        returns: embeddings of shape (B, n_dim) or (B, T, n_dim)
+        """
+        x = x.long()
+        return self.embeddings[x]  # fancy indexing works

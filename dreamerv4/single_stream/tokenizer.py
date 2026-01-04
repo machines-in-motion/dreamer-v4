@@ -306,3 +306,60 @@ class TokensToImageHead(nn.Module):
 
         x = x.view(B, T, 3, H, W)
         return x
+    
+class TokenMasker(nn.Module):
+    """
+    MAE-style patch dropout used in DreamerV4.
+    Applies a per-(B,T) masking probability sampled uniformly
+    from [0, max_mask_prob] and replaces masked tokens with a
+    single learned mask token.
+
+    Input:
+        x: [B, T, N, D] patch tokens
+
+    Output:
+        x_masked: [B, T, N, D]
+        mask:     [B, T, N] boolean mask
+    """
+
+    def __init__(self, model_dim, max_mask_prob=0.9, activate_masking=True):
+        super().__init__()
+        self.max_mask_prob = max_mask_prob
+        self.activate_masking = activate_masking
+
+        # Single learned mask token (shared across patches)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, model_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+    def forward(self, x, mask=None):
+        """
+        x: [B, T, N, D]
+        mask: optional [B, T, N] boolean mask
+        """
+        B, T, N, D = x.shape
+
+        # Only apply masking during training or if forced
+        if (self.training or self.activate_masking) and self.max_mask_prob > 0.0:
+
+            # --- Sample per-(b,t) dropout probability: [B, T] ---
+            drop_p = torch.rand(B, T, device=x.device) * self.max_mask_prob
+
+            # --- Sample random uniform noise per patch ---
+            rand = torch.rand(B, T, N, device=x.device)
+
+            # --- Build mask: rand < drop_p[b,t] ---
+            if mask is None:
+                mask = rand < drop_p.unsqueeze(-1)  # [B, T, N]
+
+            # --- Apply mask: broadcast mask_token to [B,T,N,D] ---
+            x = torch.where(
+                mask.unsqueeze(-1),                     # [B,T,N,1]
+                self.mask_token.to(x.dtype),           # [1,1,1,D] → broadcast
+                x                                      # original tokens
+            )
+        else:
+            # If no masking, still return an all-False mask
+            if mask is None:
+                mask = torch.zeros(B, T, N, dtype=torch.bool, device=x.device)
+
+        return x
