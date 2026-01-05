@@ -313,7 +313,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
     z_input = add_noise_flow_matching(z_clean, tau_vals)
     
     # 3. Student Prediction
-    pred_z1_student = dyn_model(actions, z_input, tau_idxs, step_idxs)
+    pred_z1_student, _ = dyn_model(actions, z_input, tau_idxs, step_idxs)
     
     # 4. Ramp Weighting
     # w(tau) = 0.9 * tau + 0.1
@@ -352,7 +352,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
 
             # --- Teacher 1: Start -> Middle ---
             # Pred z1 from (z_tau, tau, d/2)
-            pred_z1_t1 = inner_model(
+            pred_z1_t1, _ = inner_model(
                 actions,
                 z_in_short,
                 tau_idxs_1,
@@ -374,7 +374,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
             # New unique ID for (tau + d/2)
             tau_idxs_2 = tau_idxs_1 - (2 ** (d_min_idx - step_idxs_half)).long()
 
-            pred_z1_t2 = inner_model(
+            pred_z1_t2, _ = inner_model(
                 actions,
                 z_prime,
                 tau_idxs_2,
