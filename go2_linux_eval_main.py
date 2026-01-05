@@ -7,12 +7,15 @@ import cv2
 import threading
 import math
 from abc import ABC, abstractmethod
-from pynput import keyboard
+#from pynput import keyboard
 import struct
 import socket
 from dataclasses import dataclass
 import subprocess
 import shutil
+import torch.nn as nn
+from torchvision import transforms as T
+from PIL import Image
 
 # --- Models ---
 from models import DreamerV4Encoder, DreamerV4Decoder, DreamerV4Dynamics
@@ -36,14 +39,38 @@ NUM_TAU_LEVELS = 128
 CONTEXT_T_DYN = 32
 MAX_INTERACTIVE_LEN = 5000
 SEQ_COR_TAU_IDX = 12
+DINO_MODEL = "dinov2_vits14"
+TRAIN_REWARD_MODEL = True
+MTP_LENGTH = 8
 
 def get_device():
     if torch.backends.mps.is_available(): return torch.device("mps")
     elif torch.cuda.is_available(): return torch.device("cuda")
     return torch.device("cpu")
 
-import subprocess
-import shutil
+# ---------------------------------------------------------
+# REWARD MODEL DEFINITION
+# ---------------------------------------------------------
+class ValueTransformerWithInitial(nn.Module):
+    def __init__(self, embedding_dim=384, num_patches=256, num_layers=4, num_heads=8, dropout=0.05):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.token_count = 3 * num_patches + 2 
+        self.start_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        self.end_token = nn.Parameter(torch.randn(1, 1, embedding_dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.token_count, embedding_dim))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=num_heads, dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.value_head = nn.Sequential(nn.LayerNorm(embedding_dim), nn.Linear(embedding_dim, 1))
+
+    def forward(self, dino_current, dino_start, dino_goal):
+        B = dino_current.shape[0]
+        start_token = self.start_token.expand(B, -1, -1)
+        end_token = self.end_token.expand(B, -1, -1)
+        x = torch.cat([start_token, dino_current, dino_start, dino_goal, end_token], dim=1)
+        x = x + self.pos_embedding[:, :x.shape[1], :]
+        x = self.transformer(x)
+        return self.value_head(x[:, -1])
 
 class GstServer:
     def __init__(self, port=5000, width=128, height=128, fps=24):
@@ -53,10 +80,9 @@ class GstServer:
             return
 
         # Pipeline: Raw BGR -> x264 (Low Latency) -> TCP Server
-        # 'queue leaky=downstream' ensures the Python script never blocks if no client connects.
         self.cmd = (
             f"gst-launch-1.0 -q fdsrc ! "
-            f"videoparse format=bgr width={width} height={height} framerate={fps}/1 ! "
+            f"videoparse format=bgr width={width} height={height} framerate={int(fps)}/1 ! "
             "videoconvert ! "
             "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 bitrate=500 ! "
             "video/x-h264,stream-format=byte-stream ! "
@@ -65,7 +91,7 @@ class GstServer:
             f"tcpserversink host=0.0.0.0 port={port} sync-method=latest-keyframe"
         )
         
-        print(f"Starting GStreamer TCP Server on port {port}...")
+        print(f"Starting GStreamer TCP Server on port {port} (FPS: {fps})...")
         self.proc = subprocess.Popen(self.cmd.split(), stdin=subprocess.PIPE)
 
     def write(self, frame):
@@ -75,7 +101,6 @@ class GstServer:
                 self.proc.stdin.write(frame.tobytes())
                 self.proc.stdin.flush()
             except BrokenPipeError:
-                # GStreamer process crashed or closed
                 print("GStreamer pipe broken.")
                 self.close()
 
@@ -91,26 +116,21 @@ class GstServer:
 # 1. MOSAIC SELECTOR
 # ---------------------------------------------------------
 class TrajectorySelector:
-    def __init__(self, images_tensor):
-        """
-        images_tensor: [B, T, C, H, W] (CPU)
-        """
+    def __init__(self, images_tensor, context_len):
         self.images = images_tensor
         self.B = images_tensor.shape[0]
         self.selected_index = None
+        self.context_len = context_len
         
         # Mosaic Layout
         self.cols = 8
         self.rows = math.ceil(self.B / self.cols)
         self.thumb_h, self.thumb_w = IMG_H, IMG_W
         
-        # Create the big canvas
         self.canvas = np.zeros((self.rows * self.thumb_h, self.cols * self.thumb_w, 3), dtype=np.uint8)
         
-        # Populate canvas
         for idx in range(self.B):
-            # Get first frame: [C, H, W] -> [H, W, C] -> BGR
-            img = self.images[idx, 0].float().permute(1, 2, 0).numpy()
+            img = self.images[idx, self.context_len-1].float().permute(1, 2, 0).numpy()
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             img = np.clip(img * 255, 0, 255).astype(np.uint8)
             
@@ -118,7 +138,6 @@ class TrajectorySelector:
             y_off = r * self.thumb_h
             x_off = c * self.thumb_w
             
-            # Add index text
             cv2.putText(img, str(idx), (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             self.canvas[y_off:y_off+self.thumb_h, x_off:x_off+self.thumb_w] = img
 
@@ -142,7 +161,7 @@ class TrajectorySelector:
         while self.selected_index is None:
             cv2.imshow(window_name, self.canvas)
             key = cv2.waitKey(50)
-            if key == 27 or key == ord('q'): # Esc/Quit
+            if key == 27 or key == ord('q'): 
                 print("Selection cancelled.")
                 sys.exit(0)
                 
@@ -153,14 +172,13 @@ class TrajectorySelector:
 # 2. CONTROLLERS
 # ---------------------------------------------------------
 class Controller(ABC):
-    def __init__(self, action_dim):
+    def __init__(self, action_dim=3): # Changed default to 3 for Go2
         self.action_dim = action_dim
         self.lock = threading.Lock()
         self.running = False
         self.thread = None
+        # Go2 Actions: [x_vel, y_vel, yaw_vel]
         self._current_action = np.zeros(action_dim, dtype=np.float32)
-        self._gripper_state = -1.0 
-        self._current_action[6] = self._gripper_state
 
     def start(self):
         self.running = True
@@ -168,7 +186,6 @@ class Controller(ABC):
         self.thread.start()
 
     def stop(self):
-        """Base stop stops the wrapper thread."""
         self.running = False
         if self.thread and self.thread.is_alive():
             self.thread.join()
@@ -179,51 +196,64 @@ class Controller(ABC):
 
     def get_action(self):
         with self.lock:
-            action_to_return = self._current_action.copy()
-            self._current_action[:6] = 0.0
-            self._current_action[6] = self._gripper_state
-            return action_to_return
+            # Return current state (Zero-Order Hold)
+            return self._current_action.copy()
 
 class KeyboardController(Controller):
-    def __init__(self, action_dim=7, sensitivity=0.01):
+    def __init__(self, action_dim=3, sensitivity=0.5):
         super().__init__(action_dim)
         self.sensitivity = sensitivity
-        self.listener = None # Store reference to listener
-        self.key_map = {
-            keyboard.Key.up: (0, 1), keyboard.Key.down: (0, -1),
-            keyboard.Key.left: (1, 1), keyboard.Key.right: (1, -1),
-            'w': (2, 1), 's': (2, -1),
-        }
+        self.listener = None 
+        # Key Map for Go2
+        # Action 0: X (Forward/Back) -> Up/Down Arrows
+        # Action 1: Y (Strafe Left/Right) -> Left/Right Arrows
+        # Action 2: Yaw (Turn Left/Right) -> A/D Keys
+        self.pressed_keys = set()
 
     def _on_press(self, key):
         try: k = key.char 
         except AttributeError: k = key 
+        self.pressed_keys.add(k)
 
-        with self.lock:
-            if k in self.key_map:
-                idx, direction = self.key_map[k]
-                self._current_action[idx] += direction * self.sensitivity
-            elif key == keyboard.Key.space: self._gripper_state = 1.0 
-            elif key == keyboard.Key.enter: self._gripper_state = -1.0
-            self._current_action[6] = self._gripper_state
+    def _on_release(self, key):
+        try: k = key.char 
+        except AttributeError: k = key 
+        if k in self.pressed_keys:
+            self.pressed_keys.remove(k)
 
     def _run_loop(self):
-        # We assign the listener to self.listener so we can stop it externally
-        with keyboard.Listener(on_press=self._on_press) as listener:
-            self.listener = listener
-            listener.join() # This blocks until self.listener.stop() is called
+        # We start the listener in non-blocking mode
+        self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
+        self.listener.start()
+        
+        while self.running:
+            # Poll keys to update velocity vector
+            vx, vy, vyaw = 0.0, 0.0, 0.0
+            
+            if keyboard.Key.up in self.pressed_keys: vx += 1.0
+            if keyboard.Key.down in self.pressed_keys: vx -= 1.0
+            
+            if keyboard.Key.left in self.pressed_keys: vy += 1.0 # Go2 convention: +Y is Left
+            if keyboard.Key.right in self.pressed_keys: vy -= 1.0
+            
+            if 'a' in self.pressed_keys: vyaw += 1.0
+            if 'd' in self.pressed_keys: vyaw -= 1.0
+            
+            with self.lock:
+                self._current_action[0] = vx * self.sensitivity
+                self._current_action[1] = vy * self.sensitivity
+                self._current_action[2] = vyaw * self.sensitivity
+            
+            time.sleep(0.01)
 
     def stop(self):
-        # 1. Stop the internal pynput listener to unblock _run_loop
         if self.listener is not None:
             self.listener.stop()
-        
-        # 2. Call parent stop to join the thread
         super().stop()
 
 @dataclass
 class ControllerPose:
-    matrix: np.ndarray  # shape (4,4)
+    matrix: np.ndarray 
 
 @dataclass
 class ControllerInput:
@@ -241,36 +271,33 @@ class VRFrame:
     right_input: ControllerInput
 
 class VRController(Controller):
-    def __init__(self, action_dim=7, ip="0.0.0.0", port=5000, max_delta=0.05):
+    def __init__(self, action_dim=3, ip="0.0.0.0", port=5000, max_delta=1.0):
         super().__init__(action_dim)
         self.ip = ip
         self.port = port
-        self.max_delta = max_delta
+        self.max_delta = max_delta # Scaling factor for joysticks
         
-        # UDP Socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, self.port))
-        self.sock.settimeout(1.0) # Timeout to allow checking self.running
+        self.sock.settimeout(1.0) 
         
-        self.remote_addr = None # Stores (IP, Port) of the Quest
+        # State tracking for rising edge detection
+        self.last_right_grip = False
+        self.last_right_index = False
+        
+        # Flags for the Generator to read
+        self.set_start_flag = False
+        self.set_goal_flag = False
 
-        # State Tracking for Deltas
-        self.last_pos = None      # [x, y, z]
-        self.last_rot = None      # [roll, pitch, yaw] or quaternion (placeholder for now)
-        
+        self.remote_addr = None
         print(f"VRController listening on {self.ip}:{self.port}")
 
     def _decode_packet(self, data: bytes) -> VRFrame:
-        # Expected size: 3 matrices (16 floats) + 8 analog + 10 buttons = 48 + 8 + 10 = 66 floats
-        if len(data) != 66 * 4:
-            return None
-            
+        if len(data) != 66 * 4: return None
         floats = struct.unpack('<66f', data)
         f = iter(floats)
 
         def next_mat():
-            # Unity is usually Column Major, but let's assume standard row fill for now
-            # or just treat as 4x4 numpy array.
             return np.array([ 
                 [next(f), next(f), next(f), next(f)],
                 [next(f), next(f), next(f), next(f)],
@@ -282,20 +309,15 @@ class VRController(Controller):
         left_pose  = ControllerPose(next_mat())
         right_pose = ControllerPose(next_mat())
 
-        # Analog values
         left_joy   = (next(f), next(f))
         right_joy  = (next(f), next(f))
         left_index, right_index, left_grip, right_grip = next(f), next(f), next(f), next(f)
-
+        
         # Buttons
         btnA, btnB, btnX, btnY, thumbL, thumbR, trigL, trigR, gripL, gripR = [int(next(f)) for _ in range(10)]
-
-        # We construct the frame object (simplified for speed)
-        left_buttons = {"TriggerButton": bool(trigL)}
-        right_buttons = {"A": bool(btnA)}
         
-        left_input  = ControllerInput(left_joy, left_index, left_grip, left_buttons)
-        right_input = ControllerInput(right_joy, right_index, right_grip, right_buttons)
+        left_input  = ControllerInput(left_joy, left_index, left_grip, {})
+        right_input = ControllerInput(right_joy, right_index, right_grip, {})
 
         return VRFrame(head_pose, left_pose, right_pose, left_input, right_input)
 
@@ -307,86 +329,58 @@ class VRController(Controller):
                 frame = self._decode_packet(data)
                 if frame is None: continue
                 
-                # --- Logic to calculate actions ---
+                # --- Go2 Teleop Logic ---
+                left_x, left_y = frame.left_input.joystick
+                right_x, right_y = frame.right_input.joystick
                 
-                # 1. Extract Current Position (Right Controller)
-                # Unity Matrix element [0,3], [1,3], [2,3] are usually X, Y, Z translation
-                curr_pos = frame.right_pose.matrix[:3, 3] 
+                # Apply Deadzone
+                deadzone = 0.1
+                if abs(left_x) < deadzone: left_x = 0
+                if abs(left_y) < deadzone: left_y = 0
+                if abs(right_x) < deadzone: right_x = 0
                 
-                # Placeholder for Rotation (if you want to implement rotation deltas later)
-                # Extracting Euler angles from 4x4 matrix is slightly complex, 
-                # usually involves `scipy.spatial.transform.Rotation`
-                curr_rot = np.zeros(3) 
-
-                # Get Head Orientation (Forward and Right vectors)
-                # Unity View Matrix (localToWorld): Column 2 is Forward (Z), Column 0 is Right (X)
-                # We flatten them to the ground (y=0) to ignore looking up/down
-                head_fwd = frame.head_pose.matrix[:3, 2] # Z axis (Forward)
-                head_fwd[1] = 0 # Flatten to ground
-                head_fwd = head_fwd / (np.linalg.norm(head_fwd) + 1e-6) # Normalize
-
-                head_right = frame.head_pose.matrix[:3, 0] # X axis (Right)
-                head_right[1] = 0 # Flatten
-                head_right = head_right / (np.linalg.norm(head_right) + 1e-6)
-
-                if frame.right_input.hand_trigger > 0.5:
-                    with self.lock:
-                        if self.last_pos is not None:
-                            delta_world = curr_pos - self.last_pos
-                            
-                            # 3. Project Delta onto Head Axes (Dot Product)
-                            # This gives movement relative to where you are looking
-                            forward_change = np.dot(delta_world, head_fwd)
-                            right_change = np.dot(delta_world, head_right)
-                            vertical_change = delta_world[1] # Unity Y is Up
-
-                            # 4. Map to Action (Adjust signs to match your robot)
-                            # Action 0: Forward (Robot X)
-                            self._current_action[0] += forward_change 
-                            
-                            # Action 1: Left/Right (Robot Y). 
-                            # If Robot +Y is Left, use positive. If Right, use negative.
-                            # Your original code had "-delta_pos[0]" for X (Right), so assuming Action 1 is Left.
-                            self._current_action[1] -= right_change 
-                            
-                            # Action 2: Up/Down (Robot Z)
-                            self._current_action[2] += vertical_change
-
-                            self._current_action = np.clip(self._current_action, -self.max_delta, self.max_delta)
-                            self._current_action[5] += frame.left_input.joystick[0]
-                        
-                        # Update Gripper State
-                        # Using Right Index Trigger (0.0 to 1.0)
-                        # Map 0.0 -> -1 (Closed), 1.0 -> 1 (Open) ?? 
-                        if frame.right_input.index_trigger > 0.5:
-                            self._gripper_state = -1.0
-                        else:
-                            self._gripper_state = 1.0
-                        
-                        # Sync gripper immediately (it's stateful, not delta)
-                        self._current_action[6] = self._gripper_state
+                val_x = left_x
+                val_y = left_y
+                val_yaw = right_x
                 
-                # Update history
-                self.last_pos = curr_pos
-                self.last_rot = curr_rot
+                # --- DETECT RISING EDGES ---
+                curr_grip = frame.right_input.hand_trigger > 0.5
+                curr_index = frame.right_input.index_trigger > 0.5
+
+                with self.lock:
+                    # Set flag True if pressed now AND wasn't pressed before
+                    if curr_grip and not self.last_right_grip:
+                        self.set_start_flag = True
+
+                    if curr_index and not self.last_right_index:
+                        self.set_goal_flag = True
+
+                    self._current_action[0] = val_x * self.max_delta
+                    self._current_action[1] = val_y * self.max_delta
+                    self._current_action[2] = val_yaw * self.max_delta
+
+                self.last_right_grip = curr_grip
+                self.last_right_index = curr_index
 
             except socket.timeout:
                 continue
             except Exception as e:
                 print(f"VR Controller Error: {e}")
 
-    def send_image(self, img_np):
-        """Compresses and sends the image to the last known Quest address."""
-        if self.remote_addr is None: return
+    def pop_flags(self):
+        with self.lock:
+            s, g = self.set_start_flag, self.set_goal_flag
+            self.set_start_flag = False
+            self.set_goal_flag = False
+            return s, g
 
-        # Compress to JPEG (Quality 80 is a good balance for VR streaming)
-        success, buffer = cv2.imencode(".jpg", img_np, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        
+    def send_image(self, img_np):
+        if self.remote_addr is None: return
+        success, buffer = cv2.imencode(".jpg", img_np, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
         if success:
             try:
                 self.sock.sendto(buffer.tobytes(), self.remote_addr)
-            except Exception as e:
-                print(f"Streaming Error: {e}")
+            except Exception: pass
 
     def stop(self):
         super().stop()
@@ -396,18 +390,21 @@ class VRController(Controller):
 # 3. TRAJECTORY GENERATOR
 # ---------------------------------------------------------
 class TrajectoryGenerator:
-    def __init__(self, args, device, selected_images, selected_actions):
-        """
-        selected_images: [1, T, C, H, W] (already sliced and on device)
-        selected_actions: [1, T, D]
-        """
+    def __init__(self, args, device, selected_images, selected_actions, fps=5.0):
         self.args = args
         self.device = device
         self.running = False
         self.latest_frame = None
         self.frame_lock = threading.Lock()
-        self.target_fps = 24.0
+
+        self.v0 = None  # Value of the start frame
+        self.vN = None  # Value of the goal frame
+
+        # --- FPS Control ---
+        self.target_fps = fps
         self.frame_duration = 1.0 / self.target_fps
+        print(f"Generator configured for {self.target_fps} Hz")
+        # -------------------
         
         # Data
         self.images_ctx = selected_images
@@ -417,8 +414,60 @@ class TrajectoryGenerator:
         
         self._init_models()
         self._init_context()
+
+        # Reward Model Setup
+        self.use_reward = args.use_reward
+        if self.use_reward:
+            self._init_reward_model(args.reward_ckpt)
+            
+            # Storage for start/goal DINO features
+            self.s0_feat = None
+            self.sg_feat = None
+            
+            # Normalization for DINO
+            self.dino_norm = T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+            # Load Target Image from Disk if provided
+            if args.target_image:
+                print(f"Loading target image from {args.target_image}...")
+                try:
+                    pil_img = Image.open(args.target_image).convert("RGB")
+                    tensor_img = T.ToTensor()(pil_img).unsqueeze(0).to(self.device).to(torch.bfloat16)
+                    
+                    # Compute Feature
+                    self.sg_feat = self._get_dino_features(tensor_img)
+                    print("Goal state (sg) initialized from file.")
+                except Exception as e:
+                    print(f"Error loading target image: {e}")
+
+        # Initialize streaming with correct FPS for metadata
+        self.gst_server = GstServer(port=5000, width=IMG_W, height=IMG_H, fps=self.target_fps)
+
+    def _init_reward_model(self, ckpt_path):
+        print("Loading Reward Model & DINO...")
+        # 1. Load DINO
+        self.dino = torch.hub.load("facebookresearch/dinov2", DINO_MODEL).to(self.device)
+        self.dino = self.dino.to(dtype=torch.bfloat16)
+        self.dino.eval()
         
-        self.gst_server = GstServer(port=5000, width=IMG_W, height=IMG_H)
+        # 2. Load Reward Network
+        self.reward_model = ValueTransformerWithInitial().to(self.device)
+        self.reward_model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+        self.reward_model = self.reward_model.to(dtype=torch.bfloat16)
+        self.reward_model.eval()
+        # Optional: Compile
+        # self.reward_model = torch.compile(self.reward_model)
+
+    # Helper to get DINO features from a frame
+    @torch.no_grad()
+    def _get_dino_features(self, img_tensor):
+        # img_tensor: [1, 3, H, W] (Float 0-1)
+        # Resize to 224x224 for DINO
+        imgs_resized = torch.nn.functional.interpolate(
+            img_tensor, size=(224, 224), mode="bilinear", align_corners=False
+        )
+        imgs_norm = self.dino_norm(imgs_resized)
+        out = self.dino.forward_features(imgs_norm)
+        return out['x_norm_patchtokens'] # [1, 256, 384]
 
     def _init_models(self):
         print("Loading models...")
@@ -447,7 +496,7 @@ class TrajectoryGenerator:
             action_dim=self.action_dim, num_latents=N_LATENTS, latent_dim=BOTTLENECK_D,
             d_model=D_MODEL_DYN, num_layers=N_LAYERS_DYN, num_heads=HEADS_Q_DYN,
             num_registers=NUM_REGISTERS, seq_len=MAX_INTERACTIVE_LEN, num_tau_levels=NUM_TAU_LEVELS,
-            temporal_every=TEMPORAL_EVERY
+            temporal_every=TEMPORAL_EVERY, train_reward_model=TRAIN_REWARD_MODEL, mtp_length=MTP_LENGTH
         ).to(self.device, dtype=torch.bfloat16).eval()
         self.dyn = torch.compile(self.dyn)
         self.dyn.load_state_dict(ckpt_dyn["dyn"])
@@ -485,17 +534,21 @@ class TrajectoryGenerator:
         for i in range(num_steps):
             tau_curr = i / num_steps
             curr_tau_idx = int(((num_steps - 1 - i) + 1)*(2**(d_min_idx-step_idx)))-1
-            is_last_step = (i == num_steps - 1)
             tau_idxs = torch.full((B, 1), curr_tau_idx, dtype=torch.long, device=self.device)
             step_idxs = torch.full((B, 1), step_idx, dtype=torch.long, device=self.device)
-            
-            pred = self.dyn.forward_step(
-                action=actions_t, noisy_z=z_t, sigma_idx=tau_idxs,
-                step_idx=step_idxs, start_step_idx=t, update_cache=False
-            )
+
+            if TRAIN_REWARD_MODEL:
+                pred, final_reward_logits = self.dyn.forward_step(
+                    action=actions_t, noisy_z=z_t, sigma_idx=tau_idxs,
+                    step_idx=step_idxs, start_step_idx=t, update_cache=False
+                )
+            else:
+                pred = self.dyn.forward_step(
+                    action=actions_t, noisy_z=z_t, sigma_idx=tau_idxs,
+                    step_idx=step_idxs, start_step_idx=t, update_cache=False
+                )
             z_t = z_t + (pred - z_t) / max(1.0 - tau_curr, 1e-5) * step_val
 
-        d_min_idx = int(np.log2(NUM_TAU_LEVELS))
         tau_idxs = torch.full((B, 1), SEQ_COR_TAU_IDX, dtype=torch.long, device=self.device)
         step_idxs = torch.full((B, 1), d_min_idx, dtype=torch.long, device=self.device)
         seq_cor_tau = torch.full((B, 1, 1, 1), 1. - ((SEQ_COR_TAU_IDX + 1) / NUM_TAU_LEVELS), dtype=torch.bfloat16, device=self.device)
@@ -506,7 +559,38 @@ class TrajectoryGenerator:
             step_idx=step_idxs, start_step_idx=t, update_cache=True
         )
 
-        return z_t
+        # --- Convert Reward Logits to Scalar ---
+        scalar_reward = 0.0
+        if TRAIN_REWARD_MODEL:
+            # 1. Access the buckets buffer from the model
+            #    The RewardMTPHead has a list of heads; we use the first one to get the buckets
+            #    Structure: dyn.reward_head.heads[0].buckets
+            #    buckets shape: (NUM_BUCKETS,) e.g. [-20, ..., 20]
+            buckets = self.dyn.reward_head.heads[0].buckets
+            
+            # 2. Compute probabilities via Softmax
+            #    logits: (B, 1, MTP_LENGTH, NUM_BUCKETS) -> probs: (B, 1, MTP_LENGTH, NUM_BUCKETS)
+            probs = torch.softmax(final_reward_logits, dim=-1)
+            
+            # 3. Expected Value in Symlog Space
+            #    Sum(prob * bucket_value) over the last dimension
+            #    buckets needs to be broadcastable: (1, 1, 1, NUM_BUCKETS)
+            buckets_view = buckets.view(1, 1, 1, -1).to(probs.device).to(probs.dtype)
+            expected_symlog = (probs * buckets_view).sum(dim=-1) # (B, 1, MTP_LENGTH)
+            
+            # 4. Convert Symlog -> Real Value
+            #    We use the helper function from the first head
+            expected_value = self.dyn.reward_head.heads[0].from_symlog(expected_symlog)
+            
+            # 5. Select the immediate reward (step 0 of MTP)
+            #    Shape is (B, 1, MTP_LENGTH). We take index 0 for the immediate next step.
+            #    You could also average them if you wanted a "value" estimate over the horizon.
+            scalar_reward = expected_value[0, 0, 0].item()
+
+        if TRAIN_REWARD_MODEL:
+            return z_t, scalar_reward
+        else:
+            return z_t
 
     def start(self, controller):
         self.running = True
@@ -523,24 +607,89 @@ class TrajectoryGenerator:
         print("Generator loop started...")
         while self.running and self.t < MAX_INTERACTIVE_LEN:
             loop_start = time.time()
-            action_np = controller.get_action() 
+            action_np = controller.get_action()
             action_t = torch.from_numpy(action_np).unsqueeze(0).unsqueeze(0).to(self.device).to(torch.bfloat16)
-            
-            z_next = self._solve_frame(action_t, self.current_z, self.t)
+
+            reward_score = 0.0
+            norm_score = 0.0 # Variable for normalized score
+
+            if TRAIN_REWARD_MODEL:
+                z_next, norm_score = self._solve_frame(action_t, self.current_z, self.t)
+            else:
+                z_next = self._solve_frame(action_t, self.current_z, self.t)
             with torch.no_grad():
                 _, recon_frame = self.dec.forward_step(z_next, start_step_idx=self.t, update_cache=True)
+
+            # --- REWARD LOGIC START ---
+            if self.use_reward and hasattr(controller, 'pop_flags'):
+                set_s0, set_sg = controller.pop_flags()
+                
+                # FIX: Ensure 4D Tensor [B, C, H, W]
+                curr_img_t = recon_frame[:, 0]
+                curr_feat = self._get_dino_features(curr_img_t)
+                
+                # 3. Update Anchor States
+                if set_s0:
+                    self.s0_feat = curr_feat.clone()
+                    self.v0 = None # Reset normalization baseline
+                    print("Updated Start State (s0)")
+                    
+                if set_sg:
+                    self.sg_feat = curr_feat.clone()
+                    self.vN = None # Reset normalization max
+                    print("Updated Goal State (sg)")
+                
+                # 4. Compute Reward & Normalization
+                if self.s0_feat is not None and self.sg_feat is not None:
+                    # A. Compute V(current)
+                    v_curr = self.reward_model(curr_feat, self.s0_feat, self.sg_feat).item()
+                    reward_score = v_curr
+                    
+                    # B. Compute/Cache Baselines (v0 and vN)
+                    # We compute these ONCE when anchors change to avoid redundant compute
+                    if self.v0 is None:
+                        # V(s0) should theoretically be low (distance) or high (similarity)?
+                        # Assuming your model outputs negative distance or similarity.
+                        # We pass s0 as "current", s0 as "start", sg as "goal"
+                        self.v0 = self.reward_model(self.s0_feat, self.s0_feat, self.sg_feat).item()
+                        
+                    if self.vN is None:
+                        # V(sg) 
+                        self.vN = self.reward_model(self.sg_feat, self.s0_feat, self.sg_feat).item()
+                    
+                    # C. Normalize
+                    # Avoid division by zero
+                    denominator = self.vN - self.v0
+                    if abs(denominator) > 1e-6:
+                        norm_score = (v_curr - self.v0) / denominator
+                    else:
+                        norm_score = 0.0
 
             gen_frame = recon_frame[0, 0].float().cpu().permute(1, 2, 0).numpy()
             display_img = cv2.cvtColor(gen_frame, cv2.COLOR_RGB2BGR)
             display_img = np.clip(display_img * 255, 0, 255).astype(np.uint8)
 
+            # --- VISUALIZATION OVERLAY ---
+            if self.use_reward or TRAIN_REWARD_MODEL:
+                # Display NORMALIZED Score
+                # Green if > 0.5 (closer to goal), Red if < 0.5
+                color = (0, 255, 0) if norm_score > 0.5 else (0, 0, 255)
+                
+                # Show Raw and Normalized
+                text = f"N: {norm_score:.2f}"
+                cv2.putText(display_img, text, (5, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Status Indicators
+                if not TRAIN_REWARD_MODEL and self.s0_feat is not None:
+                    cv2.circle(display_img, (10, 10), 4, (255, 0, 0), -1) # Blue dot = s0 set
+                if not TRAIN_REWARD_MODEL and self.sg_feat is not None:
+                    cv2.circle(display_img, (20, 10), 4, (0, 255, 255), -1) # Yellow dot = sg set
+            # --- REWARD LOGIC END ---
+
             with self.frame_lock: self.latest_frame = display_img
 
-            # --- STREAMING ADDITION ---
             if hasattr(controller, 'send_image'):
                 controller.send_image(display_img)
-            # --------------------------
-            # 2. Mac Stream
             if hasattr(self, 'gst_server'):
                 self.gst_server.write(display_img)
 
@@ -559,25 +708,35 @@ def main():
     parser.add_argument("--dynamics_ckpt", type=str, required=True)
     parser.add_argument("--traj_path", type=str, required=True)
     parser.add_argument("--context_len", type=int, default=32)
-    parser.add_argument("--use_vr", action="store_true", help="Use VR Controller via UDP instead of Keyboard")
+    parser.add_argument("--use_vr", action="store_true", help="Use VR Controller")
+    parser.add_argument("--fps", type=float, default=5.0, help="Simulation FPS (default: 5.0)")
+    parser.add_argument("--use_reward", action="store_true", help="Enable reward model visualization")
+    parser.add_argument("--reward_ckpt", type=str, default="reward_model.pt", help="Path to reward model checkpoint")
+    parser.add_argument("--target_image", type=str, default=None, help="Path to initial goal image (png/jpg)")
 
     args = parser.parse_args()
-
     device = get_device()
     
     print(f"Loading trajectories from {args.traj_path}...")
     traj_data = torch.load(args.traj_path, map_location="cpu")
-    all_images = traj_data['images']
-    all_actions = traj_data['actions']
     
-    selector = TrajectorySelector(all_images)
+    if isinstance(traj_data, dict):
+        all_images = traj_data['images'] if 'images' in traj_data else traj_data['image']
+        all_actions = traj_data['actions'] if 'actions' in traj_data else traj_data['action']
+    else:
+        print("Error: trajectory file format unknown.")
+        return
+
+    selector = TrajectorySelector(all_images, args.context_len)
     idx = selector.select()
     
     print(f"Initializing generator with trajectory {idx}...")
     selected_images = all_images[idx:idx+1].to(device).to(torch.bfloat16)
     selected_actions = all_actions[idx:idx+1].to(device).to(torch.bfloat16)
-
-    generator = TrajectoryGenerator(args, device, selected_images, selected_actions)
+    
+    # Pass custom FPS here
+    generator = TrajectoryGenerator(args, device, selected_images, selected_actions, fps=args.fps)
+    
     if args.use_vr:
          controller = VRController(action_dim=generator.action_dim)
     else:
@@ -597,29 +756,21 @@ def main():
             if frame is not None:
                 cv2.imshow(window_name, frame)
             
-            # Check for quit
             key = cv2.waitKey(10)
             if key == ord('q') or key == 27:
-                print("Quit requested...")
                 break
             
             if not generator.running:
-                print("Generator finished naturally.")
                 break
                 
     except KeyboardInterrupt:
-        print("KeyboardInterrupt received...")
+        pass
     finally:
-        # Order matters: stop threads first, then destroy windows
-        print("Stopping Controller...")
+        print("Stopping...")
         controller.stop()
-        
-        print("Stopping Generator...")
         generator.stop()
-        
-        print("Closing Windows...")
         cv2.destroyAllWindows()
-        cv2.waitKey(1) # Small hack to ensure windows close on macOS
+        cv2.waitKey(1)
         print("Done.")
 
 if __name__ == "__main__":
