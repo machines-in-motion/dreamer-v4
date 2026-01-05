@@ -1151,37 +1151,53 @@ class DreamerV4Dynamics(nn.Module):
         # 2. Concatenate World Stream
         x = torch.cat([emb_act, emb_noise, emb_reg, emb_z], dim=2)
         
-        # Note: In inference (forward_step), we usually don't need the Reward Model output.
-        # Since the World tokens are trained to IGNORE the Agent token, 
-        # we can simply skip appending the Agent token here.
-        # This works perfectly with the unified weights because the World tokens
-        # only ever attended to the first N tokens anyway.
-        
+        # 3. Append Agent Token (Conditional)
+        # We ALWAYS append it if training reward model, so it can update its cache
+        if self.train_reward_model:
+            agent_part = self.agent_token.view(1, 1, 1, self.d_model).expand(B, T, -1, -1)
+            x = torch.cat([x, agent_part], dim=2)
+            
         pos_ids = torch.arange(start_step_idx, start_step_idx + T, device=x.device, dtype=torch.long)
         pos_ids = pos_ids.unsqueeze(0)
 
-        # 3. Apply Layers
+        # 4. Apply Layers
         for i, layer in enumerate(self.layers):
             if layer.temporal:
+                # Simple pass! x contains (World, Agent), cache is sized for (World, Agent).
                 x = layer(x, kv_cache=self.caches[i], position_ids=pos_ids, update_cache=update_cache)
             else:
-                # No mask needed if Agent token is absent
-                x = layer(x)
+                if self.train_reward_model:
+                    mask = self.spatial_mask.to(dtype=x.dtype)
+                    x = layer(x, attn_mask=mask)
+                else:
+                    x = layer(x)
 
-        # 4. Output
-        out_z_tokens = x[:, :, -self.num_latents:, :]
-        pred_z = self.out_proj(out_z_tokens)
-        
-        return pred_z
-    
+        # 5. Output
+        if self.train_reward_model:
+            # Separate World and Agent
+            world_x = x[:, :, :-1, :]
+            out_z_tokens = world_x[:, :, -self.num_latents:, :]
+            pred_z = self.out_proj(out_z_tokens)
+            
+            agent_x = x[:, :, -1, :] 
+            pred_rewards = self.reward_head(agent_x)
+            
+            return pred_z, pred_rewards
+        else:
+            out_z_tokens = x[:, :, -self.num_latents:, :]
+            pred_z = self.out_proj(out_z_tokens)
+            
+            return pred_z
+
+
     def init_cache(self, batch_size: int, device: torch.device, max_seq_len: int = 96):
         """Initializes KV caches for all temporal layers."""
         self.caches = []
         for layer in self.layers:
             if layer.temporal:
                 # We only cache World tokens in inference as per forward_step optimization
-                cache_bs = batch_size * self.num_world_tokens
-                
+                cache_bs = batch_size * self.total_tokens
+
                 cache = KVCache(
                     max_seq_len=max_seq_len,
                     batch_size=cache_bs,
