@@ -1,6 +1,7 @@
 import os
 import time
 import torch
+torch.compiler.reset()
 import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -206,6 +207,7 @@ def main(cfg: DictConfig):
     if rank == 0:
         print("Creating encoder and decoder models...")
 
+    # tokenizer = load_tokenizer(cfg, device=device, compile=cfg.train.use_compile)
     tokenizer = load_tokenizer(cfg, device=device, compile=cfg.train.use_compile)
     tokenizer = tokenizer.to(torch.bfloat16)
 
@@ -496,7 +498,7 @@ def main(cfg: DictConfig):
                 avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
                 avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
-                frames_per_step = cfg.train.batch_per_gpu * cfg.denoiser.context_length * world_size
+                frames_per_step = cfg.train.batch_per_gpu * cfg.denoiser.max_context_length * world_size
                 step_fps = frames_per_step / avg_step_time
                 data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
@@ -513,7 +515,7 @@ def main(cfg: DictConfig):
 
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
-        total_frames = cfg.train.batch_per_gpu * cfg.denoiser.context_length * world_size * steps_per_epoch
+        total_frames = cfg.train.batch_per_gpu * cfg.denoiser.max_context_length * world_size * steps_per_epoch
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 

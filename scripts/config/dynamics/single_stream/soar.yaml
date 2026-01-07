@@ -30,11 +30,11 @@ denoiser:
 
 train:
   device: 'cuda:0'
-  use_compile: false
+  use_compile: true
   num_epochs: 100
   batch_per_gpu: 2
   context_length: 32
-  accum_grad_steps: 10
+  accum_grad_steps: 1
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2

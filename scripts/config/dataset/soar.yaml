@@ -1,5 +1,5 @@
 dt: 0.2
 resolution: [256, 256]
 load_to_ram: true
-data_dir: /home/mim-server/datasets/soar_data_sharded/soar_data_sharded
+data_dir: /home/mim-server/datasets/soar_data_sharded
 split_seed: 123

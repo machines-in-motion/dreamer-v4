@@ -174,122 +174,226 @@ def apply_denoiser(
 # 7. Shortcut / bootstrap loss (Eq. 7 + Eq. 8)
 # ------------------------------------------------------------
 
+# def compute_bootstrap_diffusion_loss(
+#     info: dict,
+#     denoiser: DreamerV4Denoiser,
+#     actions: Optional[torch.Tensor] = None,   # (B, T, n_c)
+# ):
+#     """
+#     info: dict from ForwardDiffusionWithShortcut.forward, with keys:
+#       x                   : (B, T, N_lat, D_latent)
+#       x_tau               : (B, T, N_lat, D_latent)
+#       tau                 : (B, T) float
+#       step                : (B, T) float
+#       tau_index           : (B, T) long
+#       step_index          : (B, T) long  (0 ↔ d_min, >0 ↔ larger steps)
+#       half_step_index     : (B, T) long
+#       tau_plus_half_index : (B, T) long
+#       d_min               : scalar float
+
+#     Returns:
+#       flow_loss      : scalar (flow branch, d = d_min)
+#       bootstrap_loss : scalar (bootstrap branch, d > d_min)
+#     """
+#     x = info["x"]                         # (B, T, N_lat, D_lat)
+#     x_tau = info["x_tau"]                 # (B, T, N_lat, D_lat)
+#     tau = info["tau"]                     # (B, T) float
+#     step = info["step"]                   # (B, T) float
+#     tau_index = info["tau_index"]         # (B, T) long
+#     step_index = info["step_index"]       # (B, T) long (0..max_pow2)
+#     half_step_index = info["half_step_index"]              # (B, T) long
+#     tau_plus_half_index = info["tau_plus_half_index"]      # (B, T) long
+#     d_min = info["d_min"]                 # scalar float
+
+#     B, T, N_lat, D_lat = x.shape
+
+#     tau_b = tau.view(B, T, 1, 1)          # (B, T, 1, 1)
+#     step_b = step.view(B, T, 1, 1)        # (B, T, 1, 1)
+#     x_tau_detached = x_tau.detach()
+
+#     # -------------------------------------------------
+#     # 1) Big-step prediction:  \hat z_1 = f_θ(z_τ, τ, d)
+#     # -------------------------------------------------
+#     z_hat = apply_denoiser(
+#         denoiser,
+#         x_tau_detached.clone().requires_grad_(True),                 # (B, T, N_lat, D_lat)
+#         tau_index,             # (B, T)
+#         step_index,            # (B, T)
+#         # actions=actions,
+#         no_grad=False,
+#     )                           # -> (B, T, N_lat, D_lat)
+
+#     # =================================================
+#     # 2) Flow loss branch (d = d_min): || ẑ_1 - z_1 ||^2
+#     # =================================================
+#     flow_residual = z_hat - x                      # (B, T, N_lat, D_lat)
+#     # average over tokens & dims: (B, T)
+#     flow_sq = flow_residual.pow(2).mean(dim=(-1, -2))
+
+#     # d = d_min ↔ step_index == 0 in this convention
+#     mask_small = (step_index == 0).float()         # (B, T), 1 where d = d_min
+
+#     # ramp weight w(τ) from Eq. (8), τ ∈ [0, 1]
+#     w_tau = ramp_weight(tau)                       # (B, T)
+
+#     flow_loss_per = w_tau * flow_sq * mask_small  # (B, T)
+#     denom_flow = mask_small.sum().clamp_min(1.0)  # avoid div by 0
+#     flow_loss = flow_loss_per.sum() / denom_flow  # scalar
+
+#     # =================================================
+#     # 3) Bootstrap branch (d > d_min):
+#     #    v_target = (b1 + b2)/2, with
+#     #    b1 = [f(z_τ, τ, d/2) - z_τ] / (1 - τ)
+#     #    b2 = [f(z', τ + d/2, d/2) - z'] / (1 - (τ + d/2))
+#     #    Loss: (1 - τ)^2 || v_hat - sg(v_target) ||^2 * w(τ)
+#     # =================================================
+#     with torch.no_grad():
+#         # ------- First half-step -------
+#         f1 = apply_denoiser(
+#             denoiser,
+#             x_tau_detached.clone(),                  # (B, T, N_lat, D_lat)
+#             tau_index,              # (B, T)  use same τ
+#             half_step_index,        # (B, T)  d/2 index
+#             # actions=actions.clone(),
+#             no_grad=True,
+#         )                           # (B, T, N_lat, D_lat)
+
+#         # b1: (B, T, N_lat, D_lat)
+#         b1 = (f1 - x_tau) / (1.0 - tau_b)
+
+#         # z' = z_τ + b1 * d/2
+#         z_prime = x_tau + b1 * (step_b / 2.0)      # (B, T, N_lat, D_lat)
+
+#         # ------- Second half-step -------
+#         f2 = apply_denoiser(
+#             denoiser,
+#             z_prime,                # (B, T, N_lat, D_lat)
+#             tau_plus_half_index,    # (B, T)  τ + d/2
+#             half_step_index,        # (B, T)  d/2
+#             actions=actions.clone(),
+#             no_grad=True,
+#         )                           # (B, T, N_lat, D_lat)
+
+#         denom2 = 1.0 - (tau_b + step_b / 2.0)      # (B, T, 1, 1)
+#         b2 = (f2 - z_prime) / denom2               # (B, T, N_lat, D_lat)
+
+#         # v_target: average of the two half-step velocities
+#         v_target = 0.5 * (b1 + b2)                 # (B, T, N_lat, D_lat)  (sg via no_grad)
+
+#     # predicted velocity from big step:
+#     v_hat = (z_hat - x_tau) / (1.0 - tau_b)        # (B, T, N_lat, D_lat)
+
+#     boot_err = v_hat - v_target                    # (B, T, N_lat, D_lat)
+
+#     # x-space scaling (1 - τ)^2 and ramp weight w(τ)
+#     boot_sq = ((1.0 - tau_b) ** 2 * boot_err.pow(2)).mean(dim=(-1, -2))  # (B, T)
+
+#     mask_large = (step_index > 0).float()          # (B, T)  d > d_min
+#     boot_loss_per = w_tau * boot_sq * mask_large   # (B, T)
+
+#     denom_boot = mask_large.sum().clamp_min(1.0)
+#     bootstrap_loss = boot_loss_per.sum() / denom_boot
+
+#     return flow_loss, bootstrap_loss
+
+
+
 def compute_bootstrap_diffusion_loss(
     info: dict,
     denoiser: DreamerV4Denoiser,
-    actions: Optional[torch.Tensor] = None,   # (B, T, n_c)
+    actions: Optional[torch.Tensor] = None,
 ):
-    """
-    info: dict from ForwardDiffusionWithShortcut.forward, with keys:
-      x                   : (B, T, N_lat, D_latent)
-      x_tau               : (B, T, N_lat, D_latent)
-      tau                 : (B, T) float
-      step                : (B, T) float
-      tau_index           : (B, T) long
-      step_index          : (B, T) long  (0 ↔ d_min, >0 ↔ larger steps)
-      half_step_index     : (B, T) long
-      tau_plus_half_index : (B, T) long
-      d_min               : scalar float
-
-    Returns:
-      flow_loss      : scalar (flow branch, d = d_min)
-      bootstrap_loss : scalar (bootstrap branch, d > d_min)
-    """
-    x = info["x"]                         # (B, T, N_lat, D_lat)
-    x_tau = info["x_tau"]                 # (B, T, N_lat, D_lat)
-    tau = info["tau"]                     # (B, T) float
-    step = info["step"]                   # (B, T) float
-    tau_index = info["tau_index"]         # (B, T) long
-    step_index = info["step_index"]       # (B, T) long (0..max_pow2)
-    half_step_index = info["half_step_index"]              # (B, T) long
-    tau_plus_half_index = info["tau_plus_half_index"]      # (B, T) long
-    d_min = info["d_min"]                 # scalar float
+    x = info["x"]
+    x_tau = info["x_tau"]
+    tau = info["tau"]
+    step = info["step"]
+    tau_index = info["tau_index"]
+    step_index = info["step_index"]
+    half_step_index = info["half_step_index"]
+    tau_plus_half_index = info["tau_plus_half_index"]
+    d_min = info["d_min"]
 
     B, T, N_lat, D_lat = x.shape
 
-    tau_b = tau.view(B, T, 1, 1)          # (B, T, 1, 1)
-    step_b = step.view(B, T, 1, 1)        # (B, T, 1, 1)
-
-    # -------------------------------------------------
-    # 1) Big-step prediction:  \hat z_1 = f_θ(z_τ, τ, d)
-    # -------------------------------------------------
-    z_hat = apply_denoiser(
-        denoiser,
-        x_tau,                 # (B, T, N_lat, D_lat)
-        tau_index,             # (B, T)
-        step_index,            # (B, T)
-        actions=actions,
-        no_grad=False,
-    )                           # -> (B, T, N_lat, D_lat)
+    tau_b = tau.view(B, T, 1, 1)
+    step_b = step.view(B, T, 1, 1)
+    x_tau_detached = x_tau.detach()
 
     # =================================================
-    # 2) Flow loss branch (d = d_min): || ẑ_1 - z_1 ||^2
-    # =================================================
-    flow_residual = z_hat - x                      # (B, T, N_lat, D_lat)
-    # average over tokens & dims: (B, T)
-    flow_sq = flow_residual.pow(2).mean(dim=(-1, -2))
-
-    # d = d_min ↔ step_index == 0 in this convention
-    mask_small = (step_index == 0).float()         # (B, T), 1 where d = d_min
-
-    # ramp weight w(τ) from Eq. (8), τ ∈ [0, 1]
-    w_tau = ramp_weight(tau)                       # (B, T)
-
-    flow_loss_per = w_tau * flow_sq * mask_small  # (B, T)
-    denom_flow = mask_small.sum().clamp_min(1.0)  # avoid div by 0
-    flow_loss = flow_loss_per.sum() / denom_flow  # scalar
-
-    # =================================================
-    # 3) Bootstrap branch (d > d_min):
-    #    v_target = (b1 + b2)/2, with
-    #    b1 = [f(z_τ, τ, d/2) - z_τ] / (1 - τ)
-    #    b2 = [f(z', τ + d/2, d/2) - z'] / (1 - (τ + d/2))
-    #    Loss: (1 - τ)^2 || v_hat - sg(v_target) ||^2 * w(τ)
+    # 1) Bootstrap Target Calculation (Calculate FIRST)
+    #    Move this block before z_hat to avoid in-place 
+    #    errors with torch.compile / autograd.
     # =================================================
     with torch.no_grad():
+        # Optional: Switch to eval to avoid updating BN stats or Dropout 
+        denoiser.eval() 
+        
         # ------- First half-step -------
         f1 = apply_denoiser(
             denoiser,
-            x_tau,                  # (B, T, N_lat, D_lat)
-            tau_index,              # (B, T)  use same τ
-            half_step_index,        # (B, T)  d/2 index
-            actions=actions,
+            x_tau_detached.clone(),
+            tau_index,
+            half_step_index,
+            # Clone actions to prevent in-place mutation of the original tensor
+            actions=actions.clone() if actions is not None else None,
             no_grad=True,
-        )                           # (B, T, N_lat, D_lat)
+        )
 
-        # b1: (B, T, N_lat, D_lat)
         b1 = (f1 - x_tau) / (1.0 - tau_b)
-
-        # z' = z_τ + b1 * d/2
-        z_prime = x_tau + b1 * (step_b / 2.0)      # (B, T, N_lat, D_lat)
+        z_prime = x_tau + b1 * (step_b / 2.0)
 
         # ------- Second half-step -------
         f2 = apply_denoiser(
             denoiser,
-            z_prime,                # (B, T, N_lat, D_lat)
-            tau_plus_half_index,    # (B, T)  τ + d/2
-            half_step_index,        # (B, T)  d/2
-            actions=actions,
+            z_prime,
+            tau_plus_half_index,
+            half_step_index,
+            actions=actions.clone() if actions is not None else None,
             no_grad=True,
-        )                           # (B, T, N_lat, D_lat)
+        )
 
-        denom2 = 1.0 - (tau_b + step_b / 2.0)      # (B, T, 1, 1)
-        b2 = (f2 - z_prime) / denom2               # (B, T, N_lat, D_lat)
+        denom2 = 1.0 - (tau_b + step_b / 2.0)
+        b2 = (f2 - z_prime) / denom2
+        
+        v_target = 0.5 * (b1 + b2)
+        
+        denoiser.train() # Restore train mode if switched
 
-        # v_target: average of the two half-step velocities
-        v_target = 0.5 * (b1 + b2)                 # (B, T, N_lat, D_lat)  (sg via no_grad)
+    # =================================================
+    # 2) Big-step prediction (Gradient Tracked)
+    #    Now safe to run because no subsequent calls 
+    #    will invalidate its saved state.
+    # =================================================
+    z_hat = apply_denoiser(
+        denoiser,
+        x_tau_detached.clone().requires_grad_(True),
+        tau_index,
+        step_index,
+        # Clone here too for safety
+        actions=actions.clone() if actions is not None else None,
+        no_grad=False,
+    )
 
-    # predicted velocity from big step:
-    v_hat = (z_hat - x_tau) / (1.0 - tau_b)        # (B, T, N_lat, D_lat)
+    # =================================================
+    # 3) Losses
+    # =================================================
+    # Flow loss
+    flow_residual = z_hat - x
+    flow_sq = flow_residual.pow(2).mean(dim=(-1, -2))
+    mask_small = (step_index == 0).float()
+    w_tau = ramp_weight(tau)
+    
+    flow_loss_per = w_tau * flow_sq * mask_small
+    denom_flow = mask_small.sum().clamp_min(1.0)
+    flow_loss = flow_loss_per.sum() / denom_flow
 
-    boot_err = v_hat - v_target                    # (B, T, N_lat, D_lat)
-
-    # x-space scaling (1 - τ)^2 and ramp weight w(τ)
-    boot_sq = ((1.0 - tau_b) ** 2 * boot_err.pow(2)).mean(dim=(-1, -2))  # (B, T)
-
-    mask_large = (step_index > 0).float()          # (B, T)  d > d_min
-    boot_loss_per = w_tau * boot_sq * mask_large   # (B, T)
-
+    # Bootstrap loss
+    v_hat = (z_hat - x_tau) / (1.0 - tau_b)
+    boot_err = v_hat - v_target
+    boot_sq = ((1.0 - tau_b) ** 2 * boot_err.pow(2)).mean(dim=(-1, -2))
+    mask_large = (step_index > 0).float()
+    
+    boot_loss_per = w_tau * boot_sq * mask_large
     denom_boot = mask_large.sum().clamp_min(1.0)
     bootstrap_loss = boot_loss_per.sum() / denom_boot
 
