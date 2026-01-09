@@ -1190,3 +1190,90 @@ class DreamerV4Dynamics(nn.Module):
                 self.caches.append(cache)
             else:
                 self.caches.append(None)
+
+
+class TokenizerWrapper(nn.Module):
+    def __init__(self, cfg:DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.enc = DreamerV4Encoder(
+            image_size=(cfg.dataset.resolution[0], cfg.dataset.resolution[1]),
+            patch_size=cfg.tokenizer.patch_size,
+            d_model=cfg.tokenizer.model_dim,
+            n_layers=cfg.tokenizer.enc_num_layers*4,
+            num_heads_q=cfg.tokenizer.n_heads,
+            num_heads_kv_latent=cfg.tokenizer.n_kv_heads,
+            seq_len=cfg.tokenizer.max_context_length,
+            mlp_ratio=4.0,
+            dropout=0.0,
+            n_latents=cfg.tokenizer.num_latent_tokens,
+            bottleneck_dim=cfg.tokenizer.latent_dim,
+            temporal_every=4,
+            in_channels=3,
+            mae_max_mask_prob=0.9,  # enable MAE
+        )
+    
+        self.dec = DreamerV4Decoder(
+            image_size=(cfg.dataset.resolution[0], cfg.dataset.resolution[1]),
+            patch_size=cfg.tokenizer.patch_size,
+            d_model=cfg.tokenizer.model_dim,
+            n_layers=cfg.tokenizer.enc_num_layers*4,
+            num_heads_q=cfg.tokenizer.n_heads,
+            num_heads_kv_latent=cfg.tokenizer.n_kv_heads,
+            bottleneck_dim=cfg.tokenizer.latent_dim,
+            seq_len=cfg.tokenizer.max_context_length,
+            mlp_ratio=4,
+            dropout=0.0,
+            n_latents=cfg.tokenizer.num_latent_tokens,
+            in_channels=3,
+            temporal_every=4,
+        )
+
+    def forward(self, images):
+        P_enc, L_enc, Z = self.enc(images)
+        R_dec, x_hat = self.dec(Z)
+        return x_hat
+    
+    def encode(self, images):
+        P_enc, L_enc, Z = self.enc(images)
+        return Z
+    
+    def decode(self, latents):
+        R_dec, x_hat = self.dec(latents)
+        return x_hat
+    
+class DenoiserWrapper(nn.Module):
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.dyn = DreamerV4Dynamics(
+            action_dim=cfg.denoiser.n_actions,
+            num_latents=cfg.denoiser.num_latent_tokens,
+            latent_dim=cfg.denoiser.num_latent_tokens,
+            d_model=cfg.denoiser.model_dim,
+            num_layers=cfg.denoiser.n_layers*4,
+            num_heads=cfg.denoiser.n_heads,
+            num_registers=cfg.denoiser.num_register_tokens,
+            seq_len=cfg.denoiser.max_context_length,
+            dropout=0.0,
+            mlp_ratio=4,
+            num_tau_levels=cfg.denoiser.K_max,
+            temporal_every=4,
+        )
+
+
+    def forward(
+        self,
+        latent_tokens: torch.Tensor,          # (B, T, N_latent, D_latent)
+        diffusion_step: torch.Tensor,         # (B, T) long, τ index on finest grid
+        shortcut_length: torch.Tensor,        # (B, T) long, step index (0..max_pow2; 0 ↔ d_min)
+        actions: Optional[torch.Tensor] = None,  # (B, T, n_c)
+        causal: bool = True,
+    ) -> torch.Tensor:
+        return self.dyn(
+            action = actions, 
+            noisy_z = latent_tokens, 
+            sigma_idx = diffusion_step,
+            step_idx = shortcut_length,
+            )

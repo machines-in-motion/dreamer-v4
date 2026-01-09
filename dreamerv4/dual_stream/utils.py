@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from .tokenizer import TokenizerWrapper
-from .dynamics import DenoiserWrapper
-from omegaconf import DictConfig
+from .models import TokenizerWrapper, DenoiserWrapper
+from omegaconf import DictConfig, OmegaConf
+
 
 @torch.no_grad()
 def load_tokenizer(cfg: DictConfig, device: torch.device, compile=False) -> TokenizerWrapper:
@@ -38,8 +38,3 @@ def load_denoiser(cfg: DictConfig, device: torch.device) -> nn.Module:
     denoiser.dyn.load_state_dict(clean_sd, strict=True)
     denoiser.eval()
     return denoiser
-
-
-
-
-

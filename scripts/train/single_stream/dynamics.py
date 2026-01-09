@@ -7,8 +7,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
-
-from dreamerv4.single_stream.tokenizer import SingleStreamTokenizerWrapper 
+from dreamerv4.single_stream.utils import load_tokenizer 
 from dreamerv4.single_stream.dynamics import DreamerV4DenoiserCfg, DreamerV4Denoiser
 from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss
 
@@ -164,27 +163,6 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-@torch.no_grad()
-def load_tokenizer(cfg: DictConfig, device: torch.device, compile=False) -> SingleStreamTokenizerWrapper:
-    """
-    Load tokenizer (encoder+decoder) and heads from checkpoint.
-    """
-    tokenizer_wrapper = SingleStreamTokenizerWrapper(cfg).to(device)
-
-    state = torch.load(cfg.tokenizer_ckpt, map_location=device)
-    sd = state["model"]
-
-    # Clean FSDP `_orig_mod.` keys
-    clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-
-    tokenizer_wrapper.load_state_dict(clean_sd, strict=True)
-    tokenizer_wrapper.eval()
-
-    if compile:
-        tokenizer_wrapper = torch.compile(tokenizer_wrapper, mode="max-autotune", fullgraph=False)
-    
-    return tokenizer_wrapper
-
 @record
 @hydra.main(config_path="../config", config_name="dynamics/single_stream/soar", version_base=None)
 def main(cfg: DictConfig):
@@ -243,18 +221,11 @@ def main(cfg: DictConfig):
         drop_last=False,  # keep all test windows
     )
 
-    # Peek one batch to infer action_dim and instantiate dynamics + optimizer
-    first_batch = next(iter(train_loader))
-    action_dim = first_batch["action"].shape[-1]
-    if rank == 0:
-        print(f"Inferred action_dim={action_dim} from dataset batch")
-
     denoiser_cfg = DreamerV4DenoiserCfg(**OmegaConf.to_object(cfg.denoiser))
     denoiser = DreamerV4Denoiser(denoiser_cfg)
     diffuser = ForwardDiffusionWithShortcut(K_max=cfg.denoiser.K_max)
     denoiser.to(device)
     diffuser.to(device)
-    
     # Print parameter counts
     if rank == 0:
         learnable_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)

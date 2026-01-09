@@ -1,10 +1,12 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, List
-from .utils import create_temporal_mask
+from .blocks import create_temporal_mask
 import torch
 import torch.nn as nn
 from .blocks import EfficientTransformerBlock, DiscreteEmbedder
+from omegaconf import DictConfig, OmegaConf
+
 
 @dataclass
 class DreamerV4DenoiserCfg:
@@ -21,6 +23,7 @@ class DreamerV4DenoiserCfg:
     qk_norm: bool = True
     K_max: int = 32                # finest grid size for τ (must be power of 2)
     n_actions: int = 0  # number of action components
+    dual_stream: bool = False
 
 class DreamerV4Denoiser(nn.Module):
     """
@@ -154,3 +157,22 @@ class DreamerV4Denoiser(nn.Module):
 
         # denoised latents: (B, T, N_lat, D_latent)
         return x[:, :, :self.cfg.num_latent_tokens, :]
+    
+
+class DenoiserWrapper(nn.Module):
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        denoiser_cfg = DreamerV4DenoiserCfg(**OmegaConf.to_object(cfg.denoiser)) 
+        self.dyn = DreamerV4Denoiser(denoiser_cfg)
+
+    def forward(
+        self,
+        latent_tokens: torch.Tensor,          # (B, T, N_latent, D_latent)
+        diffusion_step: torch.Tensor,         # (B, T) long, τ index on finest grid
+        shortcut_length: torch.Tensor,        # (B, T) long, step index (0..max_pow2; 0 ↔ d_min)
+        actions: Optional[torch.Tensor] = None,  # (B, T, n_c)
+        causal: bool = True,
+    ) -> torch.Tensor:
+        return self.dyn(latent_tokens, diffusion_step, shortcut_length, actions, causal)

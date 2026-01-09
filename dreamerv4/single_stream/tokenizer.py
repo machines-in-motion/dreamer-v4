@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 from .blocks import EfficientTransformerBlock
-from .utils import create_temporal_mask, create_encoder_spatial_mask, create_decoder_spatial_mask
+from .blocks import create_temporal_mask, create_encoder_spatial_mask, create_decoder_spatial_mask
 from dataclasses import dataclass
 from omegaconf import DictConfig, OmegaConf
 import math
@@ -22,6 +22,7 @@ class CausalTokenizerConfig:
     dropout_prob: float = 0.0
     qk_norm: bool = True
     patch_size: int = 14
+    dual_stream: bool = False
    
 class CausalTokenizerEncoder(nn.Module):
     """
@@ -350,7 +351,7 @@ class TokenMasker(nn.Module):
 
             # --- Build mask: rand < drop_p[b,t] ---
             if mask is None:
-                mask = rand < drop_p.unsqueeze(-1)  # [B, T, N]
+                mask = rand < drop_p.unsqueeze(-1)  # [B, T, N]DictConfig
 
             # --- Apply mask: broadcast mask_token to [B,T,N,D] ---
             x = torch.where(
@@ -366,7 +367,7 @@ class TokenMasker(nn.Module):
         return x
     
 
-class SingleStreamTokenizerWrapper(nn.Module):
+class TokenizerWrapper(nn.Module):
     def __init__(self, cfg:DictConfig):
         super().__init__()
         self.cfg = cfg

@@ -2,169 +2,30 @@ import math
 import time
 import os
 from functools import partial  # (kept in case you extend later)
-
+import hydra
 import cv2
 import torch
 import torch.nn as nn
 from torch.nn.functional import interpolate
 from omegaconf import DictConfig, OmegaConf
 from hydra import initialize, compose
-
-from model.dynamics import *  # DreamerV4DenoiserCfg, DreamerV4Denoiser, apply_denoiser
-from model.tokenizer import (
-    CausalTokenizerDecoder,
-    CausalTokenizerEncoder,
-    CausalTokenizerConfig,
-    TokensToImageHead,
-    ImagePatchifier,
-)
-from model.utils import TokenMasker
-from dataset import SingleViewSequenceDataset
-from joy import XBoxController
-
+from dreamerv4.datasets import PushTDataset
+from dreamerv4.utils.joy import XBoxController
+from dreamerv4.single_stream.utils import load_tokenizer
+from dreamerv4.single_stream.utils import load_denoiser
 
 # -------------------------------------------------------------------------
 # Configurable paths / constants
 # -------------------------------------------------------------------------
-
-CONFIG_PATH = "config"
-
-TOKENIZER_CONFIG_NAME = "tokenizer_large_cfg1.yaml"
-TOKENIZER_CKPT_PATH = "/home/mim-server/projects/rooholla/dreamer-v4/checkpoints/tokenizer_ckpts/large/cfg2/19.pt"
-
-
-DYNAMICS_CONFIG_NAME = "dynamics_small.yaml"
-DYNAMICS_CKPT_PATH = "/home/mim-server/projects/rooholla/dreamer-v4/checkpoints/dynamics_ckpts/2025-12-04_23-37-40/checkpoints/checkpoint_step_0271149.pt"
-
 PUSHT_EPISODE_PATH = "/home/mim-server/datasets/pushT/224/episode_0.h5"
-
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-SEQ_LEN = 32          # rollout horizon in latents
-NUM_SAMPLING_STEPS = 4
-K_MAX = 128
-LATENT_SHAPE = (256, 32)  # (N_lat, D_lat) – must match your dynamics config
 JOYSTICK_ID = 0
 ACTION_SCALE = 0.15
-
-
-# -------------------------------------------------------------------------
-# Hydra helpers
-# -------------------------------------------------------------------------
-
-def load_hydra_config(config_name: str, config_path: str = CONFIG_PATH) -> DictConfig:
-    """
-    Load a Hydra config from `config_path/config_name`.
-    """
-    # version_base=None is compatible across Hydra ≥1.1
-    with initialize(config_path=config_path, version_base=None):
-        cfg = compose(config_name=config_name)
-    return cfg
-
-
-# -------------------------------------------------------------------------
-# Tokenizer wrapper
-# -------------------------------------------------------------------------
-
-class ModelWrapper(nn.Module):
-    """
-    Wraps tokenizer encoder/decoder + patchifier/image head/masker into a single module.
-    """
-
-    def __init__(self, cfg: DictConfig):
-        super().__init__()
-        self.cfg = cfg
-
-        tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer))
-
-        self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
-        self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
-        self.patchifier = ImagePatchifier(
-            cfg.tokenizer.patch_size,
-            cfg.tokenizer.model_dim,
-        )
-        self.image_head = TokensToImageHead(
-            cfg.tokenizer.model_dim,
-            cfg.dataset.resolution,
-            cfg.tokenizer.patch_size,
-        )
-        self.masker = TokenMasker(
-            cfg.tokenizer.model_dim,
-            cfg.tokenizer.num_modality_tokens,
-        )
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        End-to-end image reconstruction through tokenizer.
-
-        Args:
-            images: (B, T, C, H, W) in [0, 1]
-
-        Returns:
-            recon_images: (B, T, C, H, W) in [0, 1]
-        """
-        # 1. Normalize to [-1, 1]
-        images = (images * 2.0) - 1.0
-
-        # 2. Patchify and mask
-        tokens = self.patchifier(images)
-        masked_tokens = self.masker(tokens)
-
-        # 3. Encode / decode
-        z, _ = self.encoder(masked_tokens)
-        z_decoded = self.decoder(z)
-
-        # 4. Image head + clamp back to [0, 1]
-        recon_images = self.image_head(z_decoded)
-        recon_images = (recon_images + 1.0) / 2.0
-        return torch.clamp(recon_images, 0.0, 1.0)
-
-
-# -------------------------------------------------------------------------
-# Checkpoint helpers
-# -------------------------------------------------------------------------
-
-def load_tokenizer_model(device: torch.device) -> ModelWrapper:
-    """
-    Load tokenizer (encoder+decoder) and heads from checkpoint.
-    """
-    cfg = load_hydra_config(TOKENIZER_CONFIG_NAME)
-    model = ModelWrapper(cfg).to(device)
-
-    state = torch.load(TOKENIZER_CKPT_PATH, map_location=device)
-    sd = state["model"]
-
-    # Clean FSDP `_orig_mod.` keys
-    clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-
-    model.load_state_dict(clean_sd, strict=True)
-    model.eval()
-
-    return model
-
-
-def load_denoiser(device: torch.device) -> nn.Module:
-    """
-    Load DreamerV4 denoiser from checkpoint.
-    """
-    dynamics_cfg = load_hydra_config(DYNAMICS_CONFIG_NAME)
-    denoiser_cfg = DreamerV4DenoiserCfg(**OmegaConf.to_object(dynamics_cfg.denoiser))
-    denoiser = DreamerV4Denoiser(denoiser_cfg).to(device)
-
-    state = torch.load(DYNAMICS_CKPT_PATH, map_location=device)
-    sd = state["model"]
-
-    clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-    denoiser.load_state_dict(clean_sd, strict=True)
-    denoiser.eval()
-
-    return denoiser
-
+NUM_SAMPLING_STEPS = 4
 
 # -------------------------------------------------------------------------
 # Latent sampling (shortcut diffusion schedule)
 # -------------------------------------------------------------------------
-
 @torch.no_grad()
 def sample_video_snippet(
     denoiser: nn.Module,
@@ -173,9 +34,10 @@ def sample_video_snippet(
     batch_size: int,
     seq_len: int,
     device: torch.device,
-    num_steps: int = NUM_SAMPLING_STEPS,
-    K_max: int = K_MAX,
-    latent_shape: tuple[int, int] = LATENT_SHAPE,
+    num_steps: int,
+    K_max: int,
+    num_latent_tokens: int,
+    latent_dim: int
 ) -> torch.Tensor:
     """
     Generates a video snippet (latent trajectory) using the dyadic shortcut schedule.
@@ -196,8 +58,7 @@ def sample_video_snippet(
     """
     device = torch.device(device)
     B, T = batch_size, seq_len
-    N_lat, D_lat = latent_shape
-
+    N_lat, D_lat = num_latent_tokens, latent_dim
     # 1. Initialize pure noise at τ=0
     z = torch.randn(
         B,
@@ -246,14 +107,13 @@ def sample_video_snippet(
             print(f"  Step {k+1}/{num_steps}: τ={tau_val:.2f} -> idx={current_tau_index_val}")
 
             # Predict clean z_1
-            z_hat = apply_denoiser(
-                denoiser,
-                x_tau=z,
-                tau_index=tau_index_tensor,
-                step_index=step_index_tensor,
-                no_grad=True,
-                continuous_actions=actions,
-            )
+            with torch.no_grad():
+                z_hat = denoiser(
+                    z,
+                    diffusion_step=tau_index_tensor,
+                    shortcut_length=step_index_tensor,
+                    actions=actions,
+                )
 
             # 4. Update z_τ → z_{τ + d}
             if k == num_steps - 1:
@@ -266,23 +126,22 @@ def sample_video_snippet(
 
     return z.to(torch.float32)
 
-
 # -------------------------------------------------------------------------
 # Initial latent extraction from a PushT episode
 # -------------------------------------------------------------------------
-
-def get_initial_latents_from_pusht(
-    model: ModelWrapper,
+def get_initial_latents_from_dataset(
+    tokenizer,
+    seq_len: int,
+    resolution: tuple[int, int],
     device: torch.device,
-    seq_len: int = SEQ_LEN,
 ) -> torch.Tensor:
     """
     Load one PushT episode, encode with tokenizer, and return an initial latent
     trajectory of length seq_len (or truncated).
     """
-    dataset = SingleViewSequenceDataset(
+    dataset = PushTDataset(
         hd5_file_path=PUSHT_EPISODE_PATH,
-        traj_len=64,
+        traj_len=seq_len*2,
         load_to_ram=True,
         non_overlapping=True,
     )
@@ -290,42 +149,41 @@ def get_initial_latents_from_pusht(
     # Arbitrary index into that episode
     batch = dataset[10]
     imgs = batch["observation.image"]  # (T, C, H, W)
-    imgs = interpolate(imgs, (256, 256))  # resize to tokenizer resolution
+    imgs = interpolate(imgs, resolution)  # resize to tokenizer resolution
     imgs = imgs[None, :seq_len].to(device=device, dtype=torch.bfloat16)  # (1, T, C, H, W)
 
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        patches = model.patchifier((imgs * 2.0) - 1.0)
-        latents, _ = model.encoder(patches)
-
+        latents = tokenizer.encode(imgs)
     return latents  # (1, T, N_lat, D_lat)
-
 
 # -------------------------------------------------------------------------
 # Joystick control loop
 # -------------------------------------------------------------------------
 
-def run_joystick_control_loop():
+@hydra.main(config_path="../config", config_name="dynamics/single_stream/pushT", version_base=None)
+def main(cfg: DictConfig):
     device = DEVICE
-    print(f"Using device: {device}")
-
     # 1. Load models
     print("Loading tokenizer/model wrapper...")
-    model = load_tokenizer_model(device)
+    tokenizer = load_tokenizer(cfg, device)
 
     print("Loading dynamics/denoiser...")
-    denoiser = load_denoiser(device)
+    denoiser = load_denoiser(cfg, device)
 
     # 2. Initial latents from dataset
     print("Extracting initial latents from PushT episode...")
-    latents_full = get_initial_latents_from_pusht(model, device, seq_len=SEQ_LEN)
+    latents_full = get_initial_latents_from_dataset(tokenizer, 
+                                                    seq_len=cfg.denoiser.max_context_length, 
+                                                    resolution= tuple(cfg.dataset.resolution),
+                                                    device=device)
 
     # Construct rolling latent buffer:
     #   start from a single frame (e.g. t=10) and tile it across T-1.
     latents = latents_full[:, 10].unsqueeze(1)             # (1, 1, N_lat, D_lat)
-    latents = latents.repeat(1, SEQ_LEN - 1, 1, 1).clone() # (1, 31, N_lat, D_lat)
+    latents = latents.repeat(1, cfg.denoiser.max_context_length - 1, 1, 1).clone() # (1, 31, N_lat, D_lat)
 
     # 3. Action buffer
-    actions = torch.zeros(1, SEQ_LEN, 2, device=device)
+    actions = torch.zeros(1, cfg.denoiser.max_context_length, 2, device=device)
 
     # 4. Joystick
     joy = XBoxController(JOYSTICK_ID)
@@ -352,11 +210,12 @@ def run_joystick_control_loop():
                 latents=latents,
                 actions=actions,
                 batch_size=1,
-                seq_len=SEQ_LEN,
+                seq_len=cfg.denoiser.max_context_length,
                 device=device,
                 num_steps=NUM_SAMPLING_STEPS,
-                K_max=K_MAX,
-                latent_shape=LATENT_SHAPE,
+                K_max=cfg.denoiser.K_max,
+                num_latent_tokens=cfg.denoiser.num_latent_tokens,
+                latent_dim=cfg.denoiser.latent_dim,
             )
 
             # Use everything except the first step as the new latent buffer
@@ -365,8 +224,8 @@ def run_joystick_control_loop():
             # ---- Decode the last latent into an image ----
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 z_last = latents[:, -1].unsqueeze(1)  # (1, 1, N_lat, D_lat)
-                z_decoded = model.decoder(z_last)
-                imgs_recon = model.image_head(z_decoded)
+                z_decoded = tokenizer.decoder(z_last)
+                imgs_recon = tokenizer.image_head(z_decoded)
                 imgs_recon = (imgs_recon + 1.0) / 2.0  # [-1,1] → [0,1]
 
         # ---- Display image with OpenCV ----
@@ -382,10 +241,8 @@ def run_joystick_control_loop():
 
     cv2.destroyAllWindows()
 
-
 # -------------------------------------------------------------------------
 # Entry point
 # -------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    run_joystick_control_loop()
+    main()
