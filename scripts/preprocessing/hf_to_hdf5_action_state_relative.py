@@ -8,6 +8,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 from torch.nn.functional import interpolate
+import cv2
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -23,7 +24,6 @@ def write_shard(episodes, output_path, shard_idx, image_shape, action_shape):
     with h5py.File(output_path / f"shard_{shard_idx:04d}.h5", 'w') as f:
         # Compression and chunking settings
         comp_args = {'compression': 'gzip', 'compression_opts': 4}
-        
         # Create datasets
         images_ds = f.create_dataset('images', shape=(num_episodes, max_length, *image_shape), dtype=np.uint8, chunks=(1, max_length, *image_shape), **comp_args)
         actions_ds = f.create_dataset('actions', shape=(num_episodes, max_length, *action_shape), dtype=np.float32, chunks=(1, max_length, *action_shape), **comp_args)
@@ -55,7 +55,7 @@ def convert_dataset(args):
     output_path.mkdir(parents=True, exist_ok=True)
     
     print(f"Loading: {args.repo_id}")
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.local_dir, video_backend='pyav') if args.local_dir else LeRobotDataset(repo_id=args.repo_id, video_backend='pyav')
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.local_dir, video_backend='pyav') if args.local_dir else LeRobotDataset(repo_id=args.repo_id, video_backend='pyav', tolerance_s=0.05)
 
     source_fps = dataset.fps
     target_fps = args.target_fps if args.target_fps else source_fps
@@ -136,9 +136,13 @@ def convert_dataset(args):
                 action_rel = action - current_state
             else:
                 action_rel = action
-
-            current_episode['images'].append(resized_img.numpy().transpose(1, 2, 0))
-            current_episode['actions'].append(action_rel.numpy())
+            resized_img = resized_img.numpy().transpose(1, 2, 0).copy()
+            resized_img = (resized_img*255).astype(np.uint8)
+            resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
+            current_episode['images'].append(resized_img)
+            current_episode['actions'].append(action_rel.numpy().copy())
+            cv2.imshow('vis', resized_img)
+            cv2.waitKey(1)
 
         frame_idx_in_episode += 1
 
@@ -172,7 +176,7 @@ def main():
     parser.add_argument('--repo_id', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--local_dir', type=str, default=None)
-    parser.add_argument('--episodes_per_shard', type=int, default=1)
+    parser.add_argument('--episodes_per_shard', type=int, default=2)
     
     # Image Args
     parser.add_argument('--target_fps', type=int, default=10)

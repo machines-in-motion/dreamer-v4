@@ -16,6 +16,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 from torch.nn.functional import interpolate
+import cv2
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -150,9 +151,14 @@ def convert_dataset(args):
                 prev_action_val = current_action_val.clone() # Clone is safer
             else:
                 action_rel = current_action_val
-
-            current_episode['images'].append(resized_img.numpy().transpose(1, 2, 0))
+            
+            resized_img = resized_img.numpy().transpose(1, 2, 0).copy()
+            resized_img = (resized_img*255).astype(np.uint8)
+            resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
+            current_episode['images'].append(resized_img)
             current_episode['actions'].append(action_rel.numpy())
+            cv2.imshow('vis', resized_img)
+            cv2.waitKey(1)
 
         frame_idx_in_episode += 1
 
