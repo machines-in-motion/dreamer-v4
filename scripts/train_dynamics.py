@@ -4,15 +4,14 @@ import torch
 torch.compiler.reset()
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from functools import partial
-from dreamerv4.single_stream.utils import load_tokenizer 
+from dreamerv4.single_stream.utils import load_tokenizer, load_denoiser
 from dreamerv4.single_stream.dynamics import DreamerV4DenoiserCfg, DreamerV4Denoiser
+from dreamerv4.datasets import create_distributed_dataloader
+from dreamerv4.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
 from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss
 
 from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
-from dreamerv4.datasets import ShardedHDF5Dataset
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 import datetime
@@ -25,133 +24,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch.distributed.elastic.multiprocessing.errors import record
 torch.autograd.set_detect_anomaly(True)
 
-def save_checkpoint(
-    ckpt_path: str,
-    epoch: int,
-    global_update: int,
-    dyn: DDP,
-    optim: torch.optim.Optimizer,
-    scheduler,
-    rank: int,
-    wandb_run_id: str = None,
-    log_dir: str = None,
-):
-    if rank == 0:
-        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        ckpt = {
-            "epoch": epoch,
-            "global_update": global_update,
-            "dyn": dyn.module.state_dict(),  # <- .module to unwrap DDP
-            "optim": optim.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "wandb_run_id": wandb_run_id,
-            "log_dir": log_dir,
-        }
-        torch.save(ckpt, ckpt_path)
-        print(f"[rank0] Saved checkpoint to {ckpt_path}")
-
-def load_checkpoint(
-    ckpt_path: str,
-    dyn: DDP,
-    optim: torch.optim.Optimizer,
-    scheduler,
-    rank: int,
-    device: torch.device,
-):
-    """
-    Load FULL checkpoint saved by save_checkpoint().
-    Returns (start_epoch, global_update, wandb_run_id, log_dir).
-    """
-    if not os.path.isfile(ckpt_path):
-        if rank == 0:
-            print(f"No checkpoint found at {ckpt_path}, starting from scratch.")
-        return 0, 0, None, None  # epoch, global_update, wandb_run_id, log_dir
-
-    # Rank 0 loads from disk
-    if rank == 0:
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        print(f"[rank0] Loaded checkpoint from {ckpt_path}")
-    else:
-        ckpt = None
-
-    # Broadcast checkpoint to all ranks
-    obj_list = [ckpt]
-    dist.broadcast_object_list(obj_list, src=0)
-    ckpt = obj_list[0]
-
-    start_epoch = ckpt.get("epoch", 0)
-    global_update = ckpt.get("global_update", 0)
-    wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
-    log_dir = ckpt.get("log_dir", None)            # NEW
-
-    dyn.module.load_state_dict(ckpt["dyn"])
-
-    optim.load_state_dict(ckpt["optim"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-
-    if rank == 0:
-        print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}")
-        if wandb_run_id:
-            print(f"Resuming W&B run ID: {wandb_run_id}")
-        if log_dir:
-            print(f"Resuming log directory: {log_dir}")
-
-    return start_epoch, global_update, wandb_run_id, log_dir
-
-def create_distributed_dataloader(
-    data_dir: str,
-    window_size: int,
-    batch_size: int,
-    rank: int,
-    world_size: int,
-    num_workers: int = 4,
-    stride: int = 1,
-    seed: int = 42,
-    split: str = "train",
-    train_fraction: float = 0.9,
-    split_seed: int = 42,
-    shuffle: bool = True,
-    drop_last: bool = True,
-):
-    """
-    Create DataLoader with DistributedSampler for sharded HDF5 dataset.
-    """
-    # Create the dataset with a fixed split
-    dataset = ShardedHDF5Dataset(
-        data_dir=data_dir,
-        window_size=window_size,
-        stride=stride,
-        split=split,
-        train_fraction=train_fraction,
-        split_seed=split_seed,
-    )
-
-    # Create DistributedSampler
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=shuffle,
-        seed=seed,
-        drop_last=drop_last,
-    )
-
-    # Create DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=drop_last,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None,
-    )
-
-    return dataloader, sampler, dataset
-
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-8):
-    def lr_lambda(current_step):
+    def lr_lambda(current_, compile=cfg.train.use_compilestep):
         if current_step < num_warmup_steps:
             # Linear warmup
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -164,7 +38,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @record
-@hydra.main(config_path="../config", config_name="dynamics/single_stream/soar", version_base=None)
+@hydra.main(config_path="config", config_name="dynamics/single_stream/soar", version_base=None)
 def main(cfg: DictConfig):
     # Setup distributed training
     rank, local_rank, world_size, device = setup_distributed()
@@ -186,8 +60,11 @@ def main(cfg: DictConfig):
         print("Creating encoder and decoder models...")
 
     # tokenizer = load_tokenizer(cfg, device=device, compile=cfg.train.use_compile)
-    tokenizer = load_tokenizer(cfg, device=device, compile=cfg.train.use_compile)
-    tokenizer = tokenizer.to(torch.bfloat16)
+    tokenizer = load_tokenizer(cfg, device=device) 
+    denoiser = load_denoiser(cfg, device=device)
+    diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
+    tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
+    denoiser = denoiser.to(device, dtype=torch.bfloat16)
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
@@ -221,19 +98,14 @@ def main(cfg: DictConfig):
         drop_last=False,  # keep all test windows
     )
 
-    denoiser_cfg = DreamerV4DenoiserCfg(**OmegaConf.to_object(cfg.denoiser))
-    denoiser = DreamerV4Denoiser(denoiser_cfg)
-    diffuser = ForwardDiffusionWithShortcut(K_max=cfg.denoiser.K_max)
-    denoiser.to(device)
-    diffuser.to(device)
     # Print parameter counts
     if rank == 0:
         learnable_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
         print(f"Total learnable parameters: {learnable_params:,}")
 
-
     if cfg.train.use_compile:
         denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=False)
+        tokenizer = torch.compile(tokenizer, mode="max-autotune-no-cudagraphs", fullgraph=False)
 
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=False)
 
@@ -250,14 +122,13 @@ def main(cfg: DictConfig):
     
     wandb_run_id = None
     log_dir = None
-    ckpt_path = "./logs/dreamer_v4_dynamics/2025-11-30_08-05-07/latest.pt"
     start_epoch = 0
     global_update = 0  # counts optimizer updates
     
     if cfg.reload_checkpoint is not None:
         # Try loading checkpoint BEFORE initializing W&B
-        start_epoch, global_update, wandb_run_id, log_dir = load_checkpoint(
-            ckpt_path=ckpt_path,
+        start_epoch, global_update, wandb_run_id, log_dir = load_ddp_checkpoint(
+            ckpt_path=cfg.reload_checkpoint,
             dyn=denoiser,
             optim=optim,
             scheduler=scheduler,
@@ -330,7 +201,7 @@ def main(cfg: DictConfig):
     epoch_losses = []
     epoch_fps = []
     epoch_data_times = []
-
+    breakpoint()
     for epoch in range(start_epoch, cfg.train.num_epochs):
         # --- TRAIN PHASE ---
         denoiser.train()
@@ -439,7 +310,7 @@ def main(cfg: DictConfig):
                 if global_update % cfg.save_every == 0:
                     if rank == 0:
                         print(f"[Checkpoint] Saving at global_update={global_update}")
-                    save_checkpoint(
+                    save_ddp_checkpoint(
                         ckpt_path=ckpt_path,
                         epoch=epoch,
                         global_update=global_update,
@@ -506,7 +377,7 @@ def main(cfg: DictConfig):
             print(f"  Avg Step Time: {sum(step_times)/len(step_times):.3f}s")
             print(f"{'='*60}\n")
 
-        save_checkpoint(
+        save_ddp_checkpoint(
             ckpt_path=ckpt_path,
             epoch=epoch,
             global_update=global_update,

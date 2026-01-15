@@ -22,30 +22,30 @@ class ForwardDiffusionWithShortcut(nn.Module):
     """
     Dyadic shortcut schedule with per-frame (τ_t, d_t).
 
-    K_max must be a power of 2, e.g. 32 or 64.
-    Finest step size: d_min = 1 / K_max.
+    num_noise_levels must be a power of 2, e.g. 32 or 64.
+    Finest step size: d_min = 1 / num_noise_levels.
 
     Index convention used:
-      max_pow2 = log2(K_max)
+      max_pow2 = log2(num_noise_levels)
       step_index_raw ∈ {0..max_pow2}  (defines d = 1 / 2^step_index_raw)
       step_index      = max_pow2 - step_index_raw
         -> step_index = 0       ↔ d = d_min
         -> step_index = max_pow2 ↔ d = 1
     """
 
-    def __init__(self, K_max=32):
+    def __init__(self, num_noise_levels=32):
         super().__init__()
-        assert (K_max & (K_max - 1)) == 0, "K_max must be a power of 2"
-        self.K_max = int(K_max)
-        self.max_pow2 = int(math.log2(self.K_max))      # e.g. K_max=32 -> max_pow2=5
-        self.d_min = 1.0 / float(self.K_max)            # finest step
+        assert (num_noise_levels & (num_noise_levels - 1)) == 0, "num_noise_levels must be a power of 2"
+        self.num_noise_levels = int(num_noise_levels)
+        self.max_pow2 = int(math.log2(self.num_noise_levels))      # e.g. num_noise_levels=32 -> max_pow2=5
+        self.d_min = 1.0 / float(self.num_noise_levels)            # finest step
 
     def sample_step_noise(self, batch_size, seq_len, device):
         """
         Returns per-frame diffusion parameters:
 
           tau             : (B, T) float   τ_t ∈ {0, d_t, 2 d_t, ..., 1 - d_t}
-          step            : (B, T) float   d_t ∈ {1, 1/2, ..., 1/K_max}
+          step            : (B, T) float   d_t ∈ {1, 1/2, ..., 1/num_noise_levels}
           tau_index       : (B, T) long    τ index on finest grid: τ_t = tau_index * d_min
           step_index      : (B, T) long    our index in [0..max_pow2]; 0 ↔ d_min, max_pow2 ↔ 1
           half_step_index : (B, T) long    index for d_t/2 in same convention (step_index - 1)
@@ -79,9 +79,9 @@ class ForwardDiffusionWithShortcut(nn.Module):
 
         tau = m.float() * step                           # (B, T) float, τ_t ∈ {0, d_t, ..., 1-d_t}
 
-        # τ index on the finest grid of size K_max:
+        # τ index on the finest grid of size num_noise_levels:
         # τ_t = m * d_t; d_t / d_min = 2^{step_index}; so τ_t / d_min = m * 2^{step_index}
-        tau_index = m * (2 ** step_index)                # (B, T) long in [0 .. K_max-1]
+        tau_index = m * (2 ** step_index)                # (B, T) long in [0 .. num_noise_levels-1]
 
         # stride on finest grid for step d_t: d_t / d_min = 2^{step_index}
         stride_full = (2 ** step_index)                  # (B, T) long
@@ -89,7 +89,7 @@ class ForwardDiffusionWithShortcut(nn.Module):
 
         tau_plus_half_index = tau_index + delta_tau_index     # (B, T) long
         tau_plus_half_index = torch.clamp(
-            tau_plus_half_index, min=0, max=self.K_max - 1
+            tau_plus_half_index, min=0, max=self.num_noise_levels - 1
         )
 
         # half-step index in our convention: step_index - 1
@@ -132,7 +132,7 @@ class ForwardDiffusionWithShortcut(nn.Module):
             "half_step_index": diff["half_step_index"],            # (B, T) long
             "tau_plus_half_index": diff["tau_plus_half_index"],    # (B, T) long
             "d_min": self.d_min,                   # scalar float
-            "K_max": self.K_max,
+            "num_noise_levels": self.num_noise_levels,
         }
 
 

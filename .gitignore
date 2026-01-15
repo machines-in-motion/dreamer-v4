@@ -219,3 +219,4 @@ tokenizer_ckpt_cfg1_old_masker
 fsdp_logs
 HPC
 .vscode
+scripts/tmp

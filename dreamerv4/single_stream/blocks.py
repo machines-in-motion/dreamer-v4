@@ -64,8 +64,12 @@ class RopeEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048):
         super().__init__()
         self.dim = dim
-        self.max_seq_len = max_seq_len
-        thetas = torch.tensor([10000**(-2*i/dim) for i in range(dim//2)])
+        # self.max_seq_len = max_seq_len
+        self.max_seq_len = 1024
+        self.initialize_buffer(max_seq_len)
+        
+    def initialize_buffer(self, max_seq_len):
+        thetas = 1.0 / (10000.0 ** (torch.arange(0, self.dim, 2).float() / self.dim))
         thetas = torch.stack([thetas, thetas], dim=0).transpose(0,1).reshape(-1)
         # Pre-compute full table
         thetas_all = torch.stack([thetas*i for i in range(max_seq_len)], dim=0)
@@ -73,80 +77,97 @@ class RopeEmbedding(nn.Module):
         sin_cache = thetas_all.sin() # TxD
         self.register_buffer('cos_emb', cos_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
         self.register_buffer('sin_emb', sin_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
-
-    # def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     B, H, T, d = q.shape
-        
-    #     # Slice with offset for inference
-    #     cos_emb = self.cos_emb[:, :, offset : offset + T, :]
-    #     sin_emb = self.sin_emb[:, :, offset : offset + T, :]
-        
-    #     q_odd, q_even = q[..., ::2], q[..., 1::2]
-    #     qJ = torch.stack([-q_even, q_odd], dim=-1).reshape_as(q)
-    #     k_odd, k_even = k[..., ::2], k[..., 1::2]
-    #     kJ = torch.stack([-k_even, k_odd], dim=-1).reshape_as(k)
-        
-    #     q_rot = (q * cos_emb) + (qJ * sin_emb)
-    #     k_rot = (k * cos_emb) + (kJ * sin_emb)
-    #     return q_rot, k_rot
-    def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, H, T, d = q.shape
-        
+    
+    def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor]=None) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, H, T, d = x.shape
         # 1. Slice the buffers
         # Note: slicing creates a 'view' that still points to the DDP-synced buffer memory
-        cos_view = self.cos_emb[:, :, offset : offset + T, :]
-        sin_view = self.sin_emb[:, :, offset : offset + T, :]
-        
+        if position_ids is None:
+            cos_view = self.cos_emb[:, :,  :T, :]
+            sin_view = self.sin_emb[:, :,  :T, :]
+        else:
+            cos_view = self.cos_emb[:, :, position_ids, :]
+            sin_view = self.sin_emb[:, :, position_ids, :]
+            if cos_view.dim() < 4:
+                cos_view = cos_view.unsqueeze(2)
+                sin_view = sin_view.unsqueeze(2)
+                
         # 2. CLONE them to break the dependency on the DDP buffer
         # This ensures that if DDP syncs (overwrites) self.cos_emb later, 
         # the graph uses this safe copy.
         cos_emb = cos_view.clone()
         sin_emb = sin_view.clone()
-        
-        q_odd, q_even = q[..., ::2], q[..., 1::2]
-        qJ = torch.stack([-q_even, q_odd], dim=-1).reshape_as(q)
-        k_odd, k_even = k[..., ::2], k[..., 1::2]
-        kJ = torch.stack([-k_even, k_odd], dim=-1).reshape_as(k)
-        
-        q_rot = (q * cos_emb) + (qJ * sin_emb)
-        k_rot = (k * cos_emb) + (kJ * sin_emb)
-        return q_rot, k_rot
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        xJ = torch.stack([-x2, x1], dim=-1).reshape_as(x)        
+        x_rot = (x * cos_emb) + (xJ * sin_emb)
+        return x_rot
     
-@dataclass
 class KVCache:
-    k: Optional[torch.Tensor] = None
-    v: Optional[torch.Tensor] = None
-    max_window: int = 32 # The moving horizon size
-
-    def update(self, new_k, new_v):
-        # Concatenate along time dimension (dim=2)
-        if self.k is None:
-            self.k = new_k
-            self.v = new_v
-        else:
-            self.k = torch.cat([self.k, new_k], dim=2)
-            self.v = torch.cat([self.v, new_v], dim=2)
+    """
+    Simple rolling buffer for KV caching.
+    """
+    def __init__(self, 
+                 context_length: int, 
+                 batch_size: int, 
+                 num_heads: int, 
+                 head_dim: int, 
+                 device: torch.device, 
+                 dtype: torch.dtype):
         
-        # Enforce Moving Horizon
-        if self.k.shape[2] > self.max_window:
-            self.k = self.k[:, :, -self.max_window:, :]
-            self.v = self.v[:, :, -self.max_window:, :]
-        return self.k, self.v
+        self.context_length = context_length
+        self.curr_len = 0
+        # Preallocate buffers [B, H, S, D]
+        self.k_cache = torch.zeros(batch_size, num_heads, context_length, head_dim, device=device, dtype=dtype)
+        self.v_cache = torch.zeros(batch_size, num_heads, context_length, head_dim, device=device, dtype=dtype)
+
+    def update(self, 
+               k_new: torch.Tensor,
+               v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        k_new, v_new: [B, H, S_new, D] (usually S_new=1)
+        Returns full concatenated history [B, H, S_total, D]
+        """
+        B, H, S_new, D = k_new.shape
+        
+        # If buffer is full, roll (shift left)
+        if self.curr_len + S_new > self.context_length:
+            shift = (self.curr_len + S_new) - self.context_length
+            self.k_cache = torch.roll(self.k_cache, shifts=-shift, dims=2)
+            self.v_cache = torch.roll(self.v_cache, shifts=-shift, dims=2)
+            self.curr_len -= shift
+
+        # Insert new tokens
+        self.k_cache[:, :, self.curr_len : self.curr_len + S_new, :] = k_new
+        self.v_cache[:, :, self.curr_len : self.curr_len + S_new, :] = v_new
+
+        self.curr_len += S_new
+        # Return valid slice
+        return self.k_cache[:, :, :self.curr_len, :], self.v_cache[:, :, :self.curr_len, :]
     
-    def get_view(self, new_k, new_v):
+    def reset(self):
+        self.curr_len = 0
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+
+    def no_update(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns combined K/V for attention computation WITHOUT updating the permanent cache.
-        Used during the intermediate diffusion steps.
+        Returns current valid cache without updating.
         """
-        if self.k is None:
-            return new_k, new_v
-        return torch.cat([self.k, new_k], dim=2), torch.cat([self.v, new_v], dim=2)
+        return self.k_cache[:, :, :self.curr_len, :], self.v_cache[:, :, :self.curr_len, :]
 
 class Attention(nn.Module):
     """
     Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
     """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=False):
+    def __init__(self, 
+                 model_dim, 
+                 n_heads, 
+                 n_kv_heads=None, 
+                 dropout_prob = 0, 
+                 qk_norm=True, 
+                 max_seq_len=128, 
+                 rope_embedder = None, 
+                 flash_attention=False):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
@@ -170,7 +191,10 @@ class Attention(nn.Module):
                  v: torch.Tensor,
                  mask: Optional[torch.Tensor] = None,
                  causal: Optional[bool] = False,
-                 kv_cache: Optional[KVCache] = None)-> Tuple[torch.Tensor, torch.Tensor]:
+                 kv_cache: Optional[KVCache] = None,
+                 update_cache: bool = True,
+                 kv_position_ids: Optional[torch.Tensor] = None,
+                 q_position_ids: Optional[torch.Tensor] = None)-> Tuple[torch.Tensor, torch.Tensor]:
         """
         Multi-head (self/cross) attention forward pass.
         Args:
@@ -183,6 +207,12 @@ class Attention(nn.Module):
             y: (B, T_q, D) attention output
             A: (B, n_heads, T_q, T_k) attention weights
         """
+        # During inference where q is only for one frame, is_causal=True means your only query is at index i=0,
+        #  so it can attend to only key 0 — not all past keys. Hence, we set is_causal=False in that case to allow attending to all cached keys.     
+        if q.shape[-2] == 1:
+             is_causal = False
+        else:
+             is_causal = causal
         if mask is not None and mask.dtype not in (torch.bool, torch.float32, torch.float16, torch.bfloat16):
             mask = mask.to(torch.bool)
         B, T_q, _ = q.shape
@@ -200,26 +230,49 @@ class Attention(nn.Module):
             Q = self.g*Q
 
         # Handle RoPE and Caching
-        if kv_cache is not None:
-            # 1. Determine offset based on what is already in cache
-            current_cache_len = kv_cache.k.shape[2] if kv_cache.k is not None else 0
+        if kv_cache is not None:  
+            # If caching, we assume q is the *new* query (Sq=1) 
+            # and k,v is the *new* KV (Skv=1)
             
-            # 2. Apply RoPE to the NEW keys/queries with the correct absolute position offset
+            # Apply RoPE to the NEW k only
+            # NOTE: RoPE needs the correct absolute position index for the new token.
+            # The caller must pass correct kv_position_ids for the current step.
             if self.rope_embedder is not None:
-                Q, K = self.rope_embedder(Q, K, offset=current_cache_len)
-            # 3. Update Cache (concatenates and slices window)
-            K, V = kv_cache.update(K, V)
+                K = self.rope_embedder(K, position_ids=kv_position_ids)
+            if update_cache:
+                # Standard behavior: Add new keys to cache
+                K, V = kv_cache.update(K, V)
+
+            else: # During the diffusion steps, no temporal updates are made so the cache remains the same
+                # Read-only behavior: 
+                # We need to attend to [Cache, New_K].
+                # So we manually concat without updating the ring buffer.
+                # 1. Retrieve existing cache
+                # cache_k: [B, H, S_curr, D]
+                cache_k , cache_v = kv_cache.no_update()
+                # 2. Concat with current step's K/V
+                # k: [B, H, 1, D] -> [B, H, S_curr + 1, D]
+                K = torch.cat([cache_k, K], dim=2)
+                V = torch.cat([cache_v, V], dim=2)
+
+            # Apply RoPE to the NEW q only
+            if self.rope_embedder is not None:
+                Q = self.rope_embedder(Q, position_ids=q_position_ids) 
+                
         else:
             if self.rope_embedder is not None:
-                Q, K = self.rope_embedder(Q, K)
-        
+                # Standard behavior (uncached)
+                Q = self.rope_embedder(Q, position_ids=q_position_ids)
+                K = self.rope_embedder(K, position_ids=kv_position_ids)
+                # Q, K = self.rope_embedder(Q, K)
+
         if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 Y = F.scaled_dot_product_attention(
                     Q, K, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
-                    is_causal=causal,
+                    is_causal=is_causal,
                     scale = None,
                     enable_gqa= False if self.n_kv_heads == self.n_heads else True,
                 )  # [B, n_heads, Tq, dk]
@@ -228,7 +281,7 @@ class Attention(nn.Module):
                     Q, K, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
-                    is_causal=causal,
+                    is_causal=is_causal,
                     scale = None,
                     enable_gqa= False if self.n_kv_heads == self.n_heads else True,
                 )  # [B, n_heads, Tq, dk]
@@ -254,6 +307,9 @@ class AxialAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         causal: Optional[bool] = False,
         kv_cache: Optional[KVCache] = None,
+        update_cache: bool = True,
+        kv_position_ids: Optional[torch.Tensor] = None,
+        q_position_ids: Optional[torch.Tensor] = None,
     ):
         # q: (B, d1, ..., dN, D)
         dims_q = list(q.shape)
@@ -312,7 +368,15 @@ class AxialAttention(nn.Module):
                 raise ValueError("Unsupported mask rank for AxialAttention")
 
         # Call inner attention
-        Y_flat = self.attn(q_flat, k_flat, v_flat, mask_flat, causal=causal, kv_cache=kv_cache)  # (B*, Tq, D)
+        Y_flat = self.attn(q_flat, 
+                           k_flat, 
+                           v_flat, 
+                           mask_flat, 
+                           causal=causal, 
+                           kv_cache=kv_cache,
+                           update_cache=update_cache,
+                           kv_position_ids=kv_position_ids,
+                           q_position_ids=q_position_ids)  # (B*, Tq, D)
 
         # Reshape back to original dims
         Y_t = Y_flat.view(*q_t.shape)  # (B, d1, ..., d_{dim-1}, d_{dim+1}, ..., dN, Tq, D)
@@ -321,7 +385,7 @@ class AxialAttention(nn.Module):
 
 class EfficientTransformerLayer(nn.Module):
     """
-    A single axial transformer layer:
+    A single transformer layer as shown as one of the four layers in Fig.x of the paper.:
     - RMSNorm → AxialAttention (spatial or temporal)
     - RMSNorm → FeedForwardSwiGLU
     """
@@ -335,6 +399,7 @@ class EfficientTransformerLayer(nn.Module):
         layer_type: LayerType,
         dropout_prob: float = 0.0,
         qk_norm: bool = True,
+        is_causal: bool = True,
         rope_embedder: Optional[RopeEmbedding] = None,
     ):
         super().__init__()
@@ -342,9 +407,9 @@ class EfficientTransformerLayer(nn.Module):
 
         self.layer_type = layer_type
         self.model_dim = model_dim
-
+        self.is_causal = is_causal
         # Use shared RoPE if available
-        self.rope = rope_embedder or RopeEmbedding(model_dim // n_heads, max_seq_len)
+        self.rope = rope_embedder
 
         # Axial attention
         self.attn = AxialAttention(
@@ -367,18 +432,33 @@ class EfficientTransformerLayer(nn.Module):
 
     def forward(self, 
                 x, 
-                temporal_mask=None, 
                 spatial_mask=None,
-                layer_cache: Optional[KVCache] = None):
+                kv_cache: Optional[KVCache] = None,
+                update_cache: bool = True,
+                position_ids: Optional[torch.Tensor] = None):
         """
-        x: (B, T, S, D)
+        compute one transformer layer block as:
+        x = drop_out(Attn(RMSNorm(x))) + x
+        x = x + drop_out(FFN(RMSNorm(x)))
+        Args:
+            x: (B, T, S, D) input tensor
+            spatial_mask: (S, S) or broadcastable mask for spatial attention
+            layer_cache: optional KVCache for caching in temporal attention
+        Returns:
+            x: (B, T, S, D) output tensor
         """
         # Attention block
         h = self.norm1(x)
         if self.layer_type == LayerType.TEMPORAL:
-            h = self.attn(h, h, h, dim=1, causal=True, kv_cache = layer_cache)
+            h = self.attn(h, h, h, dim=1, 
+                          causal=self.is_causal, 
+                          kv_cache = kv_cache,
+                          update_cache=update_cache,
+                          kv_position_ids=position_ids,
+                          q_position_ids=position_ids,
+                          ) # Temporal dimension has caching
         else:
-            h = self.attn(h, h, h, dim=2, mask=spatial_mask) # Spatial dimention has no cacheing
+            h = self.attn(h, h, h, dim=2, mask=spatial_mask) # Spatial dimension has no caching (check here)
         x = x + self.dropout(h)
 
         # FFN block
@@ -390,7 +470,8 @@ class EfficientTransformerLayer(nn.Module):
 
 class EfficientTransformerBlock(nn.Module):
     """
-    A sequence of EfficientTransformerLayer objects.
+    One stack of 3 spatial + 1 temporal EfficientTransformerLayer as shown in Fig.x of the paper.
+    Allows custom layer layouts via layer_types argument.
     """
 
     def __init__(
@@ -398,13 +479,22 @@ class EfficientTransformerBlock(nn.Module):
         model_dim: int,
         n_heads: int,
         n_kv_heads: int,
-        max_seq_len: int,
+        # max_seq_len: int,
+        temporal_dim_max_seq_len: int,
+        modality_dim_max_seq_len: int,
         dropout_prob: float = 0.0,
         qk_norm: bool = True,
+        is_causal: bool = True,
         layer_types: Optional[List[LayerType]] = None,
     ):
         super().__init__()
-
+        self.model_dim = model_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.modality_dim_max_seq_len = modality_dim_max_seq_len
+        self.temporal_dim_max_seq_len = temporal_dim_max_seq_len
+        self.is_causal = is_causal
+        self.caches: Optional[List[KVCache]] = None  # to be initialized later
         # Default block layout
         if layer_types is None:
             layer_types = [
@@ -414,55 +504,85 @@ class EfficientTransformerBlock(nn.Module):
                 LayerType.TEMPORAL,
             ]
 
-        # Shared RoPE
-        rope = RopeEmbedding(model_dim // n_heads, max_seq_len)
+        self.layers = nn.ModuleList()
+        for layer in layer_types:
+            if layer == LayerType.TEMPORAL:
+                self.layers.append(
+                    EfficientTransformerLayer(
+                        model_dim=model_dim,
+                        n_heads=n_heads,
+                        n_kv_heads=n_kv_heads,
+                        max_seq_len=temporal_dim_max_seq_len,
+                        layer_type=layer,
+                        dropout_prob=dropout_prob,
+                        qk_norm=qk_norm,
+                        is_causal=is_causal,
+                        rope_embedder=RopeEmbedding(model_dim // n_heads, temporal_dim_max_seq_len),
+                    )
+                )
+            else:
+                self.layers.append(
+                    EfficientTransformerLayer(
+                        model_dim=model_dim,
+                        n_heads=n_heads,
+                        n_kv_heads=n_kv_heads,
+                        max_seq_len=modality_dim_max_seq_len,
+                        layer_type=layer,
+                        dropout_prob=dropout_prob,
+                        qk_norm=qk_norm,
+                        is_causal=False,
+                        rope_embedder=RopeEmbedding(model_dim // n_heads, modality_dim_max_seq_len),
+                    )
+                )
 
-        # Build layers
-        self.layers = nn.ModuleList([
-            EfficientTransformerLayer(
-                model_dim=model_dim,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                max_seq_len=max_seq_len,
-                layer_type=t,
-                dropout_prob=dropout_prob,
-                qk_norm=qk_norm,
-                rope_embedder=rope,
-            )
-            for t in layer_types
-        ])
-
-        self.model_dim = model_dim
-
-    def forward(self, x, temporal_mask=None, spatial_mask=None, block_caches: Optional[List[KVCache]]=None):
+    def forward(self, x, spatial_mask=None):
         assert x.size(-1) == self.model_dim
-        if block_caches is None:
-            block_caches = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
-            x = layer(
-                x,
-                temporal_mask=temporal_mask,
-                spatial_mask=spatial_mask,
-                layer_cache=block_caches[i],
-            )
+            x = layer(x, spatial_mask=spatial_mask)
+        return x
+    
+    def forward_step(self, 
+                     x: torch.Tensor,
+                     spatial_mask: Optional[torch.Tensor],
+                     start_step_idx: int,
+                     update_cache: bool = True):
+        assert self.is_causal, "KV caching only valid for causal models."
+        assert self.caches is not None, "Caches not initialized. Call init_cache() before forward_step."
+        B, T, _, _ = x.shape
+        
+        pos_ids = torch.arange(start_step_idx, start_step_idx + T, device=x.device, dtype=torch.long)
+        # pos_ids = pos_ids.unsqueeze(0)
+        # 3. Apply Layers
+
+        for i, layer in enumerate(self.layers):
+            if layer.layer_type == LayerType.TEMPORAL:
+                x = layer(x, 
+                          spatial_mask=spatial_mask,
+                          kv_cache=self.caches[i], 
+                          position_ids=pos_ids, 
+                          update_cache=update_cache)
+            else:
+                x = layer(x, spatial_mask=spatial_mask)
 
         return x
     
-class DiscreteEmbedder(nn.Module):
-    def __init__(self, n_states, n_dim):
-        super().__init__()
-        self.n_states = n_states
+    def init_cache(self, batch_size: int, device: torch.device, context_length: int, dtype: torch.dtype):
+        assert self.is_causal, "KV caching only valid for causal models."
+        """Initializes KV caches for all temporal layers."""
+        self.caches = []
+        for layer in self.layers:
+            if layer.layer_type == LayerType.TEMPORAL:
+                cache = KVCache(
+                    context_length=context_length,
+                    batch_size=int(batch_size*self.modality_dim_max_seq_len),
+                    num_heads=int(self.n_heads),
+                    head_dim=int(self.model_dim//self.n_kv_heads),
+                    device=device,
+                    dtype=dtype
+                )
+                self.caches.append(cache)
+            else:
+                self.caches.append(None)
 
-        # (n_states, n_dim) — each row = embedding for one discrete state
-        self.embeddings = nn.Parameter(torch.zeros(n_states, n_dim))
+    
 
-        # good idea: initialize like nn.Embedding
-        nn.init.normal_(self.embeddings, std=0.02)
-
-    def forward(self, x):
-        """
-        x: LongTensor of shape (B,) or (B, T) containing indices in [0, n_states)
-        returns: embeddings of shape (B, n_dim) or (B, T, n_dim)
-        """
-        x = x.long()
-        return self.embeddings[x]  # fancy indexing works

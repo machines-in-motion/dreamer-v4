@@ -43,7 +43,7 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 32             # rollout horizon in latents (T)
 NUM_SAMPLING_STEPS = 4
-K_MAX = 128
+num_noise_levels = 128
 LATENT_SHAPE = (256, 32)  # (N_lat, D_lat) – must match your dynamics config
 JOYSTICK_ID = 0
 ACTION_SCALE_WORLD = 0.12    # scaling for world model actions
@@ -178,7 +178,7 @@ def sample_video_snippet(
     seq_len: int,
     device: torch.device,
     num_steps: int = NUM_SAMPLING_STEPS,
-    K_max: int = K_MAX,
+    num_noise_levels: int = num_noise_levels,
     latent_shape: tuple[int, int] = LATENT_SHAPE,
 ) -> torch.Tensor:
     """
@@ -192,7 +192,7 @@ def sample_video_snippet(
         seq_len:         T (total rollout length).
         device:          torch.device.
         num_steps:       number of shortcut integration steps.
-        K_max:           finest grid resolution (must be power of 2).
+        num_noise_levels:           finest grid resolution (must be power of 2).
         latent_shape:    (N_lat, D_lat).
 
     Returns:
@@ -218,7 +218,7 @@ def sample_video_snippet(
 
     # 2. Setup dyadic grid parameters
     step_size = 1.0 / float(num_steps)
-    max_pow2 = int(math.log2(K_max))
+    max_pow2 = int(math.log2(num_noise_levels))
     step_index_raw = int(math.log2(num_steps))
     current_step_index = max_pow2 - step_index_raw
 
@@ -228,7 +228,7 @@ def sample_video_snippet(
         dtype=torch.long,
         device=device,
     )
-    d_min = 1.0 / K_max
+    d_min = 1.0 / num_noise_levels
 
     actions = actions.to(device=device, dtype=torch.bfloat16)
 
@@ -588,7 +588,7 @@ def run_combined_demo(timeout=600):
                 seq_len=SEQ_LEN,
                 device=device,
                 num_steps=NUM_SAMPLING_STEPS,
-                K_max=K_MAX,
+                num_noise_levels=num_noise_levels,
                 latent_shape=LATENT_SHAPE,
             )
 

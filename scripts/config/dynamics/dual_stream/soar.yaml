@@ -23,7 +23,7 @@ denoiser:
   n_kv_heads: 12
   dropout_prob: 0.0
   qk_norm: false
-  K_max: 128
+  num_noise_levels: 128
   n_discrete_actions: 0
   n_continuous_actions: 2
   discrete_action_bins: []

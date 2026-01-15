@@ -1,6 +1,9 @@
 import h5py
 import torch
 import json
+from functools import partial
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -628,6 +631,58 @@ class HDF5SequenceDataset(Dataset):
             'done': dones,
             'is_demo': is_demo
         }
+
+def create_distributed_dataloader(
+    data_dir: str,
+    window_size: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    num_workers: int = 4,
+    stride: int = 1,
+    seed: int = 42,
+    split: str = "train",
+    train_fraction: float = 0.9,
+    split_seed: int = 42,
+    shuffle: bool = True,
+    drop_last: bool = True,
+):
+    """
+    Create DataLoader with DistributedSampler for sharded HDF5 dataset.
+    """
+    # Create the dataset with a fixed split
+    dataset = ShardedHDF5Dataset(
+        data_dir=data_dir,
+        window_size=window_size,
+        stride=stride,
+        split=split,
+        train_fraction=train_fraction,
+        split_seed=split_seed,
+    )
+
+    # Create DistributedSampler
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=shuffle,
+        seed=seed,
+        drop_last=drop_last,
+    )
+
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=drop_last,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+    return dataloader, sampler, dataset
 
 if __name__ == "__main__":
     import argparse

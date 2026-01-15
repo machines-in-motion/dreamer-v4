@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.checkpoint import checkpoint
 import numpy as np
+from omegaconf import DictConfig
 
 class SymlogTwoHotHead(nn.Module):
     def __init__(self, input_dim, num_buckets=255, min_val=-20.0, max_val=20.0):
@@ -1191,7 +1192,6 @@ class DreamerV4Dynamics(nn.Module):
             else:
                 self.caches.append(None)
 
-
 class TokenizerWrapper(nn.Module):
     def __init__(self, cfg:DictConfig):
         super().__init__()
@@ -1217,7 +1217,7 @@ class TokenizerWrapper(nn.Module):
             image_size=(cfg.dataset.resolution[0], cfg.dataset.resolution[1]),
             patch_size=cfg.tokenizer.patch_size,
             d_model=cfg.tokenizer.model_dim,
-            n_layers=cfg.tokenizer.enc_num_layers*4,
+            n_layers=cfg.tokenizer.dec_num_layers*4,
             num_heads_q=cfg.tokenizer.n_heads,
             num_heads_kv_latent=cfg.tokenizer.n_kv_heads,
             bottleneck_dim=cfg.tokenizer.latent_dim,
@@ -1238,6 +1238,9 @@ class TokenizerWrapper(nn.Module):
         P_enc, L_enc, Z = self.enc(images)
         return Z
     
+    def encode_step(self, image):
+        
+    
     def decode(self, latents):
         R_dec, x_hat = self.dec(latents)
         return x_hat
@@ -1250,7 +1253,7 @@ class DenoiserWrapper(nn.Module):
         self.dyn = DreamerV4Dynamics(
             action_dim=cfg.denoiser.n_actions,
             num_latents=cfg.denoiser.num_latent_tokens,
-            latent_dim=cfg.denoiser.num_latent_tokens,
+            latent_dim=cfg.denoiser.latent_dim,
             d_model=cfg.denoiser.model_dim,
             num_layers=cfg.denoiser.n_layers*4,
             num_heads=cfg.denoiser.n_heads,
@@ -1258,7 +1261,7 @@ class DenoiserWrapper(nn.Module):
             seq_len=cfg.denoiser.max_context_length,
             dropout=0.0,
             mlp_ratio=4,
-            num_tau_levels=cfg.denoiser.K_max,
+            num_tau_levels=cfg.denoiser.num_noise_levels,
             temporal_every=4,
         )
 

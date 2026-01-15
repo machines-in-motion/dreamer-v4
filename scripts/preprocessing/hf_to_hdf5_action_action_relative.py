@@ -65,7 +65,7 @@ def convert_dataset(args):
     output_path.mkdir(parents=True, exist_ok=True)
     
     print(f"Loading: {args.repo_id}")
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.local_dir, video_backend='pyav') if args.local_dir else LeRobotDataset(repo_id=args.repo_id, video_backend='pyav')
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.local_dir, video_backend='pyav', tolerance_s=0.05) if args.local_dir else LeRobotDataset(repo_id=args.repo_id, video_backend='pyav', tolerance_s=0.05)
 
     source_fps = dataset.fps
     target_fps = args.target_fps if args.target_fps else source_fps
@@ -94,8 +94,10 @@ def convert_dataset(args):
         
         # --- Episode Boundary ---
         if curr_episode_idx != prev_episode_idx:
-            if len(current_episode['images']) > 0:
+            if len(current_episode['images']) > args.min_episode_length: # save the episode if it's long enough
                 # Save Buffer
+                # current_episode['images'] = current_episode['images'][:-1]
+                # current_episode['actions'] = current_episode['actions'][1:]
                 ep_imgs = np.stack(current_episode['images'])
                 ep_acts = np.stack(current_episode['actions'])
                 
@@ -155,10 +157,11 @@ def convert_dataset(args):
             resized_img = resized_img.numpy().transpose(1, 2, 0).copy()
             resized_img = (resized_img*255).astype(np.uint8)
             resized_img = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
-            current_episode['images'].append(resized_img)
-            current_episode['actions'].append(action_rel.numpy())
             cv2.imshow('vis', resized_img)
             cv2.waitKey(1)
+            if frame_idx_in_episode > args.min_episode_length:
+                current_episode['images'].append(resized_img)
+                current_episode['actions'].append(action_rel.numpy())
 
         frame_idx_in_episode += 1
 
@@ -193,12 +196,13 @@ def main():
     parser.add_argument('--repo_id', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--local_dir', type=str, default=None)
-    parser.add_argument('--episodes_per_shard', type=int, default=100)
+    parser.add_argument('--episodes_per_shard', type=int, default=1)
     
     # Image Args
     parser.add_argument('--target_fps', type=int, default=10)
     parser.add_argument('--width', type=int, default=256)
     parser.add_argument('--height', type=int, default=256)
+    parser.add_argument('--min_episode_length', type=int, default=1000)
     parser.add_argument('--rectangular', action='store_true', default=True, help="Pad images to square")
     
     # Action/State Args

@@ -12,12 +12,15 @@ def load_tokenizer(cfg: DictConfig, device: torch.device, compile=False) -> Toke
     tokenizer_wrapper = TokenizerWrapper(cfg).to(device)
 
     state = torch.load(cfg.tokenizer_ckpt, map_location=device)
-    sd = state["model"]
+    
+    sd_enc = state["enc"]
+    clean_enc = {k.replace("_orig_mod.", ""): v for k, v in sd_enc.items()}
 
-    # Clean FSDP `_orig_mod.` keys
-    clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    sd_dec = state["dec"]
+    clean_dec = {k.replace("_orig_mod.", ""): v for k, v in sd_dec.items()}
+    tokenizer_wrapper.enc.load_state_dict(clean_enc, strict=True)
+    tokenizer_wrapper.dec.load_state_dict(clean_dec, strict=True)
 
-    tokenizer_wrapper.load_state_dict(clean_sd, strict=True)
     tokenizer_wrapper.eval()
 
     if compile:
@@ -33,7 +36,7 @@ def load_denoiser(cfg: DictConfig, device: torch.device) -> nn.Module:
     """
     denoiser = DenoiserWrapper(cfg).to(device)
     state = torch.load(cfg.dynamics_ckpt, map_location=device)
-    sd = state["model"]
+    sd = state[cfg.dynamics_model_ckpt_name]
     clean_sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
     denoiser.dyn.load_state_dict(clean_sd, strict=True)
     denoiser.eval()

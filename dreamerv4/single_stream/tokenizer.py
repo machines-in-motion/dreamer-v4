@@ -40,10 +40,7 @@ class CausalTokenizerEncoder(nn.Module):
         num_layers = cfg.enc_num_layers
 
         # S_mod + N_latent
-        self.num_spatial_tokens = cfg.num_modality_tokens + cfg.num_latent_tokens
-
-        # Temporal max length used for RoPE / masks
-        self.max_seq_len = max(cfg.max_context_length, self.num_spatial_tokens)
+        self.modality_dim_max_seq_len = cfg.num_modality_tokens + cfg.num_latent_tokens
 
         # Transformer blocks
         self.layers = nn.ModuleList([
@@ -53,7 +50,8 @@ class CausalTokenizerEncoder(nn.Module):
                 n_kv_heads=cfg.n_kv_heads,
                 dropout_prob=cfg.dropout_prob,
                 qk_norm=cfg.qk_norm,
-                max_seq_len=self.max_seq_len,
+                temporal_dim_max_seq_len=cfg.max_context_length,
+                modality_dim_max_seq_len=self.modality_dim_max_seq_len,
             )
             for _ in range(num_layers)
         ])
@@ -71,18 +69,11 @@ class CausalTokenizerEncoder(nn.Module):
         )
         self.register_buffer("spatial_mask", spatial_mask)
 
-        # Temporal causal mask for max_seq_len; we slice [:T, :T] in forward
-        temporal_mask_full = create_temporal_mask(
-            self.max_seq_len,
-            device=torch.device("cpu"),
-        )
-        self.register_buffer("temporal_mask_full", temporal_mask_full)
-
         # Project to latent_dim (typically < model_dim)
         self.output_proj = nn.Linear(cfg.model_dim, cfg.latent_dim)
         self.output_nonlinearity = nn.Tanh()
 
-    def forward(self, x: torch.Tensor, causal: bool = True):
+    def forward(self, x: torch.Tensor):
         """
         x: (B, T, S_mod, D_model)
         returns:
@@ -95,8 +86,6 @@ class CausalTokenizerEncoder(nn.Module):
             f"Expected S_mod={self.cfg.num_modality_tokens}, got {S_mod}"
         assert D == self.cfg.model_dim, \
             f"Expected D_model={self.cfg.model_dim}, got {D}"
-        assert T <= self.max_seq_len, \
-            f"T={T} exceeds max_seq_len={self.max_seq_len}"
 
         # Append learned latent tokens at the end of each modality sequence
         # learned_latent_tokens: (1, 1, N_latent, D)
@@ -104,17 +93,9 @@ class CausalTokenizerEncoder(nn.Module):
         latent_tokens = self.learned_latent_tokens.expand(B, T, -1, -1)
         x = torch.cat([x, latent_tokens], dim=2)  # (B, T, S_mod + N_latent, D)
 
-        # Temporal mask (slice from precomputed)
-        if causal:
-            temporal_mask = self.temporal_mask_full[:T, :T]
-        else:
-            temporal_mask = None
-
-        spatial_mask = self.spatial_mask  # already on correct device via .to(...)
-
         # Pass through transformer stack
         for layer in self.layers:
-            x = layer(x, temporal_mask=temporal_mask, spatial_mask=spatial_mask)
+            x = layer(x, spatial_mask=self.spatial_mask)
 
         # Project to latent_dim and squash
         x = self.output_nonlinearity(self.output_proj(x))
@@ -134,15 +115,12 @@ class CausalTokenizerDecoder(nn.Module):
               (these will typically go into an image head)
     """
 
-    def __init__(self, cfg: CausalTokenizerConfig):
+    def __init__(self, cfg: CausalTokenizerConfig, max_num_forward_steps=None):
         super().__init__()
         self.cfg = cfg
 
         model_dim = cfg.model_dim
         num_layers = cfg.dec_num_layers
-
-        self.num_spatial_tokens = cfg.num_modality_tokens + cfg.num_latent_tokens
-        self.max_seq_len = max(cfg.max_context_length, self.num_spatial_tokens)
 
         self.layers = nn.ModuleList([
             EfficientTransformerBlock(
@@ -151,7 +129,8 @@ class CausalTokenizerDecoder(nn.Module):
                 n_kv_heads=cfg.n_kv_heads,
                 dropout_prob=cfg.dropout_prob,
                 qk_norm=cfg.qk_norm,
-                max_seq_len=self.max_seq_len,
+                modality_dim_max_seq_len=cfg.num_modality_tokens + cfg.num_latent_tokens,
+                temporal_dim_max_seq_len=(max_num_forward_steps if max_num_forward_steps is not None else cfg.max_context_length),
             )
             for _ in range(num_layers)
         ])
@@ -168,18 +147,10 @@ class CausalTokenizerDecoder(nn.Module):
             cfg.num_latent_tokens,
         )
         self.register_buffer("spatial_mask", spatial_mask)
-
-        # Temporal mask (static at max_seq_len)
-        temporal_mask_full = create_temporal_mask(
-            self.max_seq_len,
-            device=torch.device("cpu"),
-        )
-        self.register_buffer("temporal_mask_full", temporal_mask_full)
-
         # Project latents from latent_dim → model_dim
         self.input_proj = nn.Linear(cfg.latent_dim, cfg.model_dim)
 
-    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, T, N_latent, D_latent)
         returns:
@@ -192,8 +163,7 @@ class CausalTokenizerDecoder(nn.Module):
             f"Expected last dim={self.cfg.latent_dim}, got {D_latent}"
         assert S_lat == self.cfg.num_latent_tokens, \
             f"Expected spatial dim={self.cfg.num_latent_tokens}, got {S_lat}"
-        assert T <= self.max_seq_len, \
-            f"Temporal dimension {T} exceeds max_seq_len {self.max_seq_len}"
+
 
         # Project latents to model_dim
         x = self.input_proj(x)  # (B, T, N_latent, D_model)
@@ -203,21 +173,51 @@ class CausalTokenizerDecoder(nn.Module):
         modality_tokens = self.learned_modality_tokens.expand(B, T, -1, -1).contiguous()
         x = torch.cat([modality_tokens, x], dim=2)  # (B, T, S_mod + N_latent, D_model)
 
-        # Temporal mask
-        if causal:
-            temporal_mask = self.temporal_mask_full[:T, :T]
-        else:
-            temporal_mask = None
-
-        spatial_mask = self.spatial_mask
-
         # Transformer stack
         for layer in self.layers:
-            x = layer(x, temporal_mask=temporal_mask, spatial_mask=spatial_mask)
+            x = layer(x, spatial_mask=self.spatial_mask)
 
         # Return only the decoded modality tokens (drop the latent positions)
         S_mod = self.cfg.num_modality_tokens
         return x[:, :, :S_mod, :]   # (B, T, S_mod, D_model)
+    
+    def forward_step(self, x: torch.Tensor, start_step_idx: int, update_cache: bool = True) -> torch.Tensor:
+        """
+        x: (B, T, N_latent, D_latent)
+        returns:
+          modality_tokens: (B, T, S_mod, D_model)
+        """
+        assert x.dim() == 4, "Input tensor must be 4D (B, T, N_latent, D_latent)"
+        B, T, S_lat, D_latent = x.shape
+
+        assert D_latent == self.cfg.latent_dim, \
+            f"Expected last dim={self.cfg.latent_dim}, got {D_latent}"
+        assert S_lat == self.cfg.num_latent_tokens, \
+            f"Expected spatial dim={self.cfg.num_latent_tokens}, got {S_lat}"
+
+        # Project latents to model_dim
+        x = self.input_proj(x)  # (B, T, N_latent, D_model)
+
+        # Prepend learned modality tokens
+        # learned_modality_tokens: (1, 1, S_mod, D_model) -> (B, T, S_mod, D_model)
+        modality_tokens = self.learned_modality_tokens.expand(B, T, -1, -1).contiguous()
+        x = torch.cat([modality_tokens, x], dim=2)  # (B, T, S_mod + N_latent, D_model)
+
+        # Transformer stack
+        for layer in self.layers:
+            x = layer.forward_step(x, 
+                                   spatial_mask=self.spatial_mask,
+                                   start_step_idx=start_step_idx, 
+                                   update_cache=update_cache)
+
+        # Return only the decoded modality tokens (drop the latent positions)
+        S_mod = self.cfg.num_modality_tokens
+        return x[:, :, :S_mod, :]   # (B, T, S_mod, D_model)
+    
+    def init_cache(self, batch_size: int, device: torch.device, context_length: int, dtype: torch.dtype):
+        """Initializes KV caches for all temporal layers."""
+        for layer in self.layers:
+            layer.init_cache(batch_size, device, context_length, dtype)
 
 class ImagePatchifier(nn.Module):
     """
@@ -366,14 +366,13 @@ class TokenMasker(nn.Module):
 
         return x
     
-
 class TokenizerWrapper(nn.Module):
-    def __init__(self, cfg:DictConfig):
+    def __init__(self, cfg:DictConfig, max_num_forward_steps=None):
         super().__init__()
         self.cfg = cfg
         tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer)) 
         self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
-        self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
+        self.decoder = CausalTokenizerDecoder(tokenizer_cfg, max_num_forward_steps=max_num_forward_steps)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
         self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
         self.masker = TokenMasker(cfg.tokenizer.model_dim)
@@ -382,21 +381,36 @@ class TokenizerWrapper(nn.Module):
         images = (images*2.)-1. # Translate the images in +-1 range
         tokens = self.patchifier(images)
         masked_tokens = self.masker(tokens)
-        z, _ = self.encoder(masked_tokens)
+        z, _ = self.enc(masked_tokens)
         z_decoded = self.decoder(z)
         recon_images = self.image_head(z_decoded)
         # return  torch.clamp((recon_images + 1)/2., 0., 1.)
-        return (recon_images + 1)/2.
+        return (recon_images + 1)/2. 
     
+    def decode_step(self, x: torch.Tensor, start_step_idx: int, update_cache: bool = True):
+        z_decoded = self.decoder.forward_step(x, start_step_idx, update_cache)
+        imgs_recon = self.image_head(z_decoded)
+        imgs_recon = (imgs_recon + 1.0) / 2.0  # [-1,1] → [0,1]
+        imgs_recon = torch.clamp(imgs_recon, 0.0, 1.0)
+        return imgs_recon
+    
+    def decode(self, latents):
+        z_decoded = self.decoder(latents)
+        imgs_recon = self.image_head(z_decoded)
+        imgs_recon = (imgs_recon + 1.0) / 2.0  # [-1,1] → [0,1]
+        imgs_recon = torch.clamp(imgs_recon, 0.0, 1.0)
+        return imgs_recon
+    
+    def init_cache(self,
+                   batch_size, 
+                   context_length, 
+                   device, 
+                   dtype):
+        self.decoder.init_cache(batch_size, device, context_length, dtype)
+
     def encode(self, images):
         images = (images*2.)-1. # Translate the images in +-1 range
         tokens = self.patchifier(images)
         masked_tokens = self.masker(tokens)
         z, _ = self.encoder(masked_tokens)
         return z
-    
-    def decode(self, latents):
-        z_decoded = self.decoder(latents)
-        recon_images = self.image_head(z_decoded)
-        # return  torch.clamp((recon_images + 1)/2., 0., 1.)
-        return (recon_images + 1)/2.
