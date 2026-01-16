@@ -1,3 +1,4 @@
+import contextlib
 import math
 import time
 import os
@@ -12,9 +13,10 @@ from omegaconf import DictConfig, OmegaConf
 from hydra import initialize, compose
 from dreamerv4.datasets import PushTDataset
 from dreamerv4.utils.joy import XBoxController
-from dreamerv4.single_stream.utils import load_tokenizer
-from dreamerv4.single_stream.utils import load_denoiser
+from dreamerv4.models.utils import load_tokenizer
+from dreamerv4.models.utils import load_denoiser
 from dreamerv4.sampling import AutoRegressiveForwardDynamics
+
 # -------------------------------------------------------------------------
 # Configurable paths / constants
 # -------------------------------------------------------------------------
@@ -56,7 +58,7 @@ def get_initial_latents_from_dataset(
 # Joystick control loop
 # -------------------------------------------------------------------------
 
-@hydra.main(config_path="config", config_name="dynamics/single_stream/pushT", version_base=None)
+@hydra.main(config_path="config", config_name="dynamics/pushT", version_base=None)
 def main(cfg: DictConfig):
     # 1. Load models
     print("Loading models")
@@ -67,24 +69,23 @@ def main(cfg: DictConfig):
     imgs, actions = get_initial_latents_from_dataset(resolution= tuple(cfg.dataset.resolution), device=device)
 
     world = AutoRegressiveForwardDynamics(denoiser, tokenizer, context_length=CONTEXT_LEN, device=device, dtype=dtype)
-    
+    use_cuda = (device.type == "cuda")
+    ctx = torch.autocast("cuda", dtype=dtype) if use_cuda else contextlib.nullcontext()
     # Reset the world model with initial images and actions
-    with torch.autocast(device_type="cuda", dtype=dtype):
+    with ctx:
         world.reset(imgs[:,:NUM_INIT_FRAMES], actions[:, :NUM_INIT_FRAMES])
     
     action_t = torch.zeros(1, 1, actions.shape[-1]).to(device, dtype=dtype)
     joy = XBoxController(JOYSTICK_ID)
 
     print("Starting joystick-controlled DreamerV4 rollout...")
-    for i in tqdm(range(NUM_FORWARD_STEPS)):
+    for i in tqdm(range(NUM_FORWARD_STEPS-cfg.denoiser.max_context_length)):
         tic = time.time()
         states = joy.getStates()
         cmd_right = states["right_joy"] 
         action_t[..., 0] = -cmd_right[1]* 0.1
         action_t[..., 1] =  cmd_right[0]* 0.1
-
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with ctx:
             img = world.step(action_t)
            
         img = (img[0].permute(1,2,0)*255).to(torch.uint8).cpu().numpy()

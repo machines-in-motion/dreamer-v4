@@ -16,8 +16,8 @@ authors = [
 
 dependencies = [
     "torch>=2.2.0",
-    "lpips-0.1.4",
-    "tensorboard-2.20.0"
+    "lpips>=0.1.4",
+    "tensorboard>=2.20.0"
 ]
 
 [tool.setuptools.packages.find]

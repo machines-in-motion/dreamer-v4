@@ -21,8 +21,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
-from dreamerv4.single_stream.tokenizer import TokenizerWrapper 
-from dreamerv4.single_stream.blocks import EfficientTransformerLayer
+from dreamerv4.models.tokenizer import TokenizerWrapper 
+from dreamerv4.models.blocks import EfficientTransformerLayer
 
 from dreamerv4.datasets import ShardedHDF5Dataset
 from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
@@ -32,6 +32,7 @@ import wandb
 import datetime
 import math
 
+assert torch.cuda.is_available(), "Tokenizer training requires CUDA"
 class RMSLossScaler:
     """
     Tracks running RMS for named losses and returns normalized losses.
@@ -267,8 +268,9 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @record
-@hydra.main(config_path="config", config_name="tokenizer/single_stream/soar", version_base=None)
+@hydra.main(config_path="config", config_name="tokenizer/soar", version_base=None)
 def main(cfg: DictConfig):
+    torch.backends.cuda.matmul.allow_tf32 = cfg.train.enable_fast_matmul
     # Setup distributed training
     rank, local_rank, world_size, device = setup_distributed()
 
@@ -325,7 +327,7 @@ def main(cfg: DictConfig):
     tokenizer.to(device)
 
     if cfg.train.use_compile:
-        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
 
     # Print parameter counts
     if rank == 0:
@@ -342,7 +344,7 @@ def main(cfg: DictConfig):
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
-        num_workers=4,
+        num_workers=cfg.train.num_workers,
         stride=1,
         seed=cfg.seed,
         split="train",
@@ -358,7 +360,7 @@ def main(cfg: DictConfig):
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
-        num_workers=4,
+        num_workers=cfg.train.num_workers,
         stride=1,
         seed=cfg.seed,          # seed for sampler sharding (not for split itself)
         split="test",
@@ -368,10 +370,10 @@ def main(cfg: DictConfig):
         drop_last=False,  # keep all test windows
     )
 
-    tokenizer = setup_fsdp_model(tokenizer, mixed_precision=True, sharding_strategy="FULL_SHARD")
+    tokenizer = setup_fsdp_model(tokenizer, mixed_precision=cfg.train.mixed_precision, sharding_strategy="FULL_SHARD")
     # Create optimizer
     params = tokenizer.parameters()
-    optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01) # try increasing to 0.03–0.05? (apparently normal range for tokenizer)
+    optim = torch.optim.AdamW(params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay) 
 
     steps_per_epoch = len(train_loader)
     STEPS_PER_EPOCH = steps_per_epoch
@@ -386,7 +388,7 @@ def main(cfg: DictConfig):
         # Try loading checkpoint BEFORE initializing W&B
         start_epoch, global_update, wandb_run_id, log_dir = load_fsdp_checkpoint(
             ckpt_path=cfg.reload_checkpoint,
-            model= model,
+            model= tokenizer,
             optim=optim,
             scheduler=scheduler,
             rms_norm=rms_norm,
@@ -485,6 +487,7 @@ def main(cfg: DictConfig):
 
             # Move data to device
             images = batch['image'].to(device, non_blocking=True)  # (B, T, C, H, W)
+            # actions are present for future conditioning but unused in tokenizer reconstruction training.
             actions = batch['action'].to(device, non_blocking=True)  # (B, T, action_dim)
 
             # Convert to bfloat16
@@ -499,11 +502,10 @@ def main(cfg: DictConfig):
             # Zero grads at the start of each accumulation window
             if micro_idx == 0:
                 optim.zero_grad(set_to_none=True)
-
-            x_hat = tokenizer(images)
-
+            
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                x_hat = tokenizer(images)
             # --- Tokenizer reconstruction losses: MSE + 0.2 * LPIPS, with RMS normalization ---
-
             # 1) Pixel MSE in the native scale of your data
             mse_loss = nn.functional.mse_loss(x_hat, images)
 
@@ -538,7 +540,11 @@ def main(cfg: DictConfig):
             accum_norm = accum_norm + loss.detach().item()
 
             # Backward pass
-            loss.backward()
+            if not is_last_micro:
+                with tokenizer.no_sync():
+                    loss.backward()
+            else:
+                loss.backward()
 
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
@@ -589,7 +595,7 @@ def main(cfg: DictConfig):
                         ckpt_path=ckpt_path,
                         epoch=epoch,
                         global_update=global_update,
-                        model=model, 
+                        model=tokenizer, 
                         optim=optim,
                         scheduler=scheduler,
                         rms_norm=rms_norm,
@@ -660,9 +666,10 @@ def main(cfg: DictConfig):
         with torch.no_grad():
             for step_idx, batch in enumerate(test_loader):
                 images = batch['image'].to(device, non_blocking=True).to(torch.bfloat16)
+                # actions are present for future conditioning but unused in tokenizer reconstruction training.
                 actions = batch['action'].to(device, non_blocking=True).to(torch.bfloat16)
 
-                x_hat = model(images)
+                x_hat = tokenizer(images)
 
                 # Raw validation loss (no RMS normalization needed for monitoring)
                 mse_loss = nn.functional.mse_loss(x_hat, images)
@@ -717,12 +724,12 @@ def main(cfg: DictConfig):
             print(f"  Avg Data Time / step: {avg_data_time_epoch:.3f}s")
             print(f"  Avg Step Time: {sum(step_times)/len(step_times):.3f}s")
             print(f"{'='*60}\n")
-
+        print(f"Saving checkpoint for epoch {epoch+1} at path: {ckpt_path}")
         save_fsdp_checkpoint(
-            ckpt_path=f"/scratch/rk4342/dreamer-v4/fsdp_logs/{epoch}.pt",
+            ckpt_path=ckpt_path,
             epoch=epoch,
             global_update=global_update,
-            model = model,
+            model = tokenizer,
             optim=optim,
             scheduler=scheduler,
             rms_norm=rms_norm,

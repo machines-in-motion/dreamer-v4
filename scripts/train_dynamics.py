@@ -1,12 +1,11 @@
 import os
 import time
 import torch
-torch.compiler.reset()
 import torch.nn as nn
 import torch.distributed as dist
 from functools import partial
-from dreamerv4.single_stream.utils import load_tokenizer, load_denoiser
-from dreamerv4.single_stream.dynamics import DenoiserWrapper
+from dreamerv4.models.utils import load_tokenizer
+from dreamerv4.models.dynamics import DenoiserWrapper
 from dreamerv4.datasets import create_distributed_dataloader
 from dreamerv4.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
 from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss
@@ -22,7 +21,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed.elastic.multiprocessing.errors import record
-torch.autograd.set_detect_anomaly(True)
+from pathlib import Path
+# torch.autograd.set_detect_anomaly(True)
+# torch.compiler.reset()
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-8):
     def lr_lambda(current_step):
@@ -38,14 +39,15 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @record
-@hydra.main(config_path="config", config_name="dynamics/single_stream/soar", version_base=None)
+@hydra.main(config_path="config", config_name="dynamics/soar-large", version_base=None)
 def main(cfg: DictConfig):
+    torch.backends.cuda.matmul.allow_tf32 = cfg.train.enable_fast_matmul
     # Setup distributed training
     rank, local_rank, world_size, device = setup_distributed()
     # Print info only from rank 0
     if rank == 0:
         print(f"Initialized distributed training with {world_size} GPUs")
-        print(f"Running on {world_size // 8} nodes with 8 GPUs each")
+        print(f"Running on {world_size} GPUs")
         print(f"MASTER_ADDR: {os.environ.get('MASTER_ADDR', 'not set')}")
         print(f"MASTER_PORT: {os.environ.get('MASTER_PORT', 'not set')}")
     
@@ -59,7 +61,6 @@ def main(cfg: DictConfig):
     if rank == 0:
         print("Creating encoder and decoder models...")
 
-    # tokenizer = load_tokenizer(cfg, device=device, compile=cfg.train.use_compile)
     tokenizer = load_tokenizer(cfg, device=device) 
     denoiser = DenoiserWrapper(cfg)
     diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
@@ -68,11 +69,11 @@ def main(cfg: DictConfig):
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
-        window_size=cfg.tokenizer.max_context_length,
+        window_size=cfg.denoiser.max_context_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
-        num_workers=4,
+        num_workers=cfg.train.num_workers,
         stride=1,
         seed=cfg.seed,
         split="train",
@@ -84,11 +85,11 @@ def main(cfg: DictConfig):
 
     test_loader, test_sampler, test_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
-        window_size=cfg.tokenizer.max_context_length,
+        window_size=cfg.denoiser.max_context_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
-        num_workers=4,
+        num_workers=cfg.train.num_workers,
         stride=1,
         seed=cfg.seed,          # seed for sampler sharding (not for split itself)
         split="test",
@@ -109,34 +110,31 @@ def main(cfg: DictConfig):
         p.requires_grad_(False)
     
     if cfg.train.use_compile:
-        denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=False)
+        # denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=False)
+        denoiser = torch.compile(denoiser, mode="max-autotune", fullgraph=True)
         tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
 
 
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=False)
 
     # Create optimizer
-    optim = torch.optim.AdamW(denoiser.parameters(), lr=1e-4, weight_decay=0.1)
-    
-
-
+    optim = torch.optim.AdamW(denoiser.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
     steps_per_epoch = len(train_loader)
     steps_per_epoch = steps_per_epoch
     total_steps = cfg.train.num_epochs * steps_per_epoch // cfg.train.accum_grad_steps
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
-
     
-    wandb_run_id = None
-    log_dir = None
+    wandb_run_id = cfg.wandb.run_name
+    log_dir = cfg.output_dir
     start_epoch = 0
     global_update = 0  # counts optimizer updates
 
-    if cfg.dynamics_ckpt is not None:
+    if cfg.reload_checkpoint is not None:
         # Try loading checkpoint BEFORE initializing W&B
-        print("Resuming from checkpoint:", cfg.dynamics_ckpt)
+        print("Resuming from checkpoint:", cfg.reload_checkpoint)
         start_epoch, global_update, wandb_run_id, log_dir = load_ddp_checkpoint(
-            ckpt_path=cfg.dynamics_ckpt,
+            ckpt_path=cfg.reload_checkpoint,
             model=denoiser,
             optim=optim,
             scheduler=scheduler,
@@ -147,8 +145,9 @@ def main(cfg: DictConfig):
             print("Not resuming from checkpoint, starting from scratch.")
 
     # TensorBoard + wandb (rank 0 only)
+    ckpt_path = None
     if rank == 0:
-        # Use stable log_dir if resuming, otherwise create new one
+        # Use stable log_dir if resuming, otdist.all_reduce(loss_sum_t, op=dist.ReduceOp.SUM)herwise create new one
         if log_dir is None:
             now = datetime.datetime.now()
             log_dir = f"./logs/dreamer_v4_dynamics/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -184,7 +183,7 @@ def main(cfg: DictConfig):
         # Capture the W&B run ID for saving in checkpoint
         wandb_run_id = wandb.run.id
 
-        tb_writer = SummaryWriter(log_dir=log_dir)
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
     else:
         tb_writer = None
         wandb_run_id = None
@@ -200,6 +199,12 @@ def main(cfg: DictConfig):
 
     # Synchronize before training
     dist.barrier()
+    
+    if rank == 0:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, os.path.join(log_dir, "config.yaml"))
+    dist.barrier()
+    
     if rank == 0:
         print("Starting warmup iterations...")
 
@@ -248,7 +253,7 @@ def main(cfg: DictConfig):
             # Time the training step
             torch.cuda.synchronize(device)
             step_start = time.perf_counter()
-
+controller = VRController(action_dim=generator.action_dim)
             # Forward pass
             # Zero grads at the start of each accumulation window
             if micro_idx == 0:
@@ -259,7 +264,6 @@ def main(cfg: DictConfig):
                     z_clean = tokenizer.encode(images).detach().clone()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # z_clean_bf16 = z_clean.to(torch.bfloat16)
                 diffused_info = diffuser(z_clean)
                 flow_loss, bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser, actions=actions)
             # 1. Calculate TOTAL loss for THIS micro-batch
@@ -282,7 +286,6 @@ def main(cfg: DictConfig):
                 optim.step()
                 scheduler.step()
                 global_update += 1
-
                 total_mean = torch.tensor([accum_total], device=device)
                 dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)   # average across ranks
                 sync_loss = total_mean.item()
@@ -385,7 +388,7 @@ def main(cfg: DictConfig):
             ckpt_path=ckpt_path,
             epoch=epoch,
             global_update=global_update,
-            dyn=denoiser,
+            model=denoiser,
             optim=optim,
             scheduler=scheduler,
             rank=rank,
@@ -431,3 +434,4 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+controller = VRController(action_dim=generator.action_dim)

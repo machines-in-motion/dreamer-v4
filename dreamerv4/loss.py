@@ -2,7 +2,7 @@ import math
 from typing import Optional, List
 import torch
 import torch.nn as nn
-from .single_stream.dynamics import DreamerV4Denoiser
+from .models.dynamics import DreamerV4Denoiser
 
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
     """
