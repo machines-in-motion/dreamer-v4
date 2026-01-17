@@ -25,14 +25,14 @@ pip install -e .
 
 ## Quickstart: run the interactive demos
 
-First download our checkpoints and downscaled datasets:
+First download our [checkpoints](https://huggingface.co/Rooholla/dreamer-v4) and downscaled datasets:
 
 | Checkpoint | Parameters | Dataset | Config | Resolution | Download |
 |:-----------|:----------:|:-----------------:|:----------------:|:----------------:|:---------------:|
-| Tokenizer           | 400M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/) | [config](scripts/config/tokenizer/soar.yaml) |  256×256 | [📦]() |
-| PushT Dynamics      | 110M | [MiM PushT]() | [config](scripts/config/dynamics/pushT.yaml)  |  256×256 | [📦]() |
-| SOAR Small Dynamics | 110M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-small.yaml) | 256×256 | [📦]() |
-| SOAR Large Dynamics | 1.5B | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-large.yaml)  | 128×128 | Soon! |
+| Tokenizer           | 400M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/) | [config](scripts/config/tokenizer/soar.yaml) |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/tokenizer-soar-400M.pt?download=true) |
+| Dynamics      | 110M | [MiM PushT]() | [config](scripts/config/dynamics/pushT.yaml)  |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamics-pushT-110M.pt?download=true) |
+| Dynamics | 110M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-small.yaml) | 256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamicsl-soar-110M.pt?download=true) |
+| Dynamics | 1.5B | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-large.yaml)  | 128×128 | Soon! |
 
 
 Now you can run the interactive world environments as follows. By default, the scripts will use the keyboard to command the robot (WASD keys). However we strongly recommend using an X-Box USB joystick to interact with the environments. In this case, add the `--xbox` argument to the play scripts:
@@ -184,4 +184,4 @@ If you use our codebase for your projects and research, we would appreciate givi
 ```
 
 ## Acknowledgement 
-We would like to acknowledge the computational resources allocated to our project by [NYU Torch](https://www.nyu.edu/life/information-technology/research-computing-services/high-performance-computing/high-performance-computing-nyu-it.html) and [Jean Zay](http://www.idris.fr/eng/jean-zay/jean-zay-presentation-eng.html) HPCs. This project is developed at [Machines in Motion Lab (MiM)](https://www.machinesinmotion.org/) at [NYU Center for Robotics and Embodied Intelligence (CREO)](https://engineering.nyu.edu/research/centers/nyu-center-robotics-and-embodied-intelligence-creo) with equal contribution from [Joseph Amigo](https://scholar.google.com/citations?user=-PPor9IAAAAJ&hl=en) and [Rooholla Khorrambakht](https://scholar.google.com/citations?user=VdgZUjoAAAAJ&hl=en). We would also like to acknowledge the use of AI (Preplexity, ChatGPT 5.2, and Gemeni) in accelerating the development of this project.
+We would like to acknowledge the computational resources allocated to our project by [NYU Torch](https://www.nyu.edu/life/information-technology/research-computing-services/high-performance-computing/high-performance-computing-nyu-it.html), LAAS-Gepetto, ANITI, and [Jean Zay](http://www.idris.fr/eng/jean-zay/jean-zay-presentation-eng.html). This project is developed at [Machines in Motion Lab (MiM)](https://www.machinesinmotion.org/) at [NYU Center for Robotics and Embodied Intelligence (CREO)](https://engineering.nyu.edu/research/centers/nyu-center-robotics-and-embodied-intelligence-creo) with equal contribution from [Joseph Amigo](https://scholar.google.com/citations?user=-PPor9IAAAAJ&hl=en) and [Rooholla Khorrambakht](https://scholar.google.com/citations?user=VdgZUjoAAAAJ&hl=en). We would also like to acknowledge the use of AI (Perplexity, ChatGPT 5.2, and Gemini) in accelerating the development of this project.
