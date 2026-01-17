@@ -55,9 +55,11 @@ python scripts/play-pushT.py \
 ```
 Running above will pops up an openCV windown showing the world-model predicted frames as you command it with your joystick. 
 
-**Note 1**: We will release a VR control mode using a Meta Quest3 for this environment soon.
+**Requirement**: The small world models (110M parameters) run in real-time on a single 4090 GPU and require only 8GB of VRAM. The information for the large model will be provided upon its release in the future. 
 
-**Note 2:** The demo uses `NUM_INIT_FRAMES=8`, `CONTEXT_LEN=32`, `NUM_FORWARD_STEPS=1000` in the script. We’ll expose these as Hydra overrides in a follow-up cleanup.
+**Note:** The demo uses `NUM_INIT_FRAMES=8`, `CONTEXT_LEN=32`, `NUM_FORWARD_STEPS=1000` in the script. We’ll expose these as Hydra overrides in a follow-up cleanup.
+
+**ToDo**: We will release a VR control mode using a Meta Quest3 for this environment soon.
 
 ## Training
 ### Dataset Preparation
@@ -127,6 +129,8 @@ torchrun --standalone --nproc_per_node=1 scripts/train_dynamics.py \
 - `dataset.data_dir` should point to the sharded dataset folder containing `metadata.json` and `shard_*.h5`.
 - `--nproc_per_node` controls the number of GPUs. Increase to use multiple GPUs on one machine.
 - For multi-node runs, rely on your cluster launcher (SLURM) + torchrun env vars; we’ll document an example later.
+
+**Requirement**: The small dynamic model (110M parameters) was trained on 4xH200 GPUs for 72 hours (SOAR dataset) while PushT model was trained on a single RTX6000 Pro (97GB) for same ammount of time. The tokenizer was trained on 24 H200 GPUs for 48 hours. With change of batch size and context length all our small models can be trained on a single RTX6000 Pro. 
 
 ## Repository Structure
 
