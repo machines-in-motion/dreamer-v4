@@ -420,7 +420,7 @@ class EfficientTransformerLayer(nn.Module):
     ):
         super().__init__()
         assert isinstance(layer_type, LayerType)
-        assert is_causal, "Currently only causal layers are implemented. The temoral attention layer will need to be fixed in the future for non-causal modeling."
+        assert is_causal and layer_type == LayerType.TEMPORAL, "Currently only causal layers are implemented. The temoral attention layer will need to be fixed in the future for non-causal modeling."
 
         self.layer_type = layer_type
         self.model_dim = model_dim
