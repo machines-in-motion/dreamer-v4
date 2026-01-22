@@ -3,7 +3,7 @@ defaults:
  - /tokenizer: /pushT
 
 dual_stream: false
-dynamics_ckpt:  checkpoints/dynamics_ckpts/pushT-110M.pt
+dynamics_ckpt:  null #checkpoints/dynamics_ckpts/pushT-110M.pt
 reload_checkpoint: null
 output_dir: checkpoints/dynamics/pushT-video/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000

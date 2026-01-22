@@ -286,11 +286,9 @@ def main(cfg: DictConfig):
             # Encode (Frozen)
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    breakpoint()
                     z_clean = tokenizer.encode(images).detach().clone()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                breakpoint()
                 diffused_info = diffuser(z_clean)
                 flow_loss, bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser, actions=actions)
             # 1. Calculate TOTAL loss for THIS micro-batch

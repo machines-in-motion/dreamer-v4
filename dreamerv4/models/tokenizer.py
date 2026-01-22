@@ -374,7 +374,7 @@ class TokenizerWrapper(nn.Module):
         super().__init__()
         self.cfg = cfg
         tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer)) 
-        self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
+        self.encoder = CausalTokenizerEncoder(tokenizer_cfg, max_num_forward_steps=max_num_forward_steps)
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg, max_num_forward_steps=max_num_forward_steps)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
         self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
