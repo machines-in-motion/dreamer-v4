@@ -110,10 +110,11 @@ def load_ddp_checkpoint(
     start_epoch = ckpt.get("epoch", 0)
     global_update = ckpt.get("global_update", 0)
     wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
-    log_dir = ckpt.get("log_dir", None)            # NEW
-    model.module.load_state_dict(ckpt["model"])
-    optim.load_state_dict(ckpt["optim"])
-    scheduler.load_state_dict(ckpt["scheduler"])
+    log_dir = ckpt.get("log_dir", None)       
+    # breakpoint()     # NEW
+    model.module._orig_mod.load_state_dict(ckpt["model"])
+    # optim.load_state_dict(ckpt["optim"])
+    # scheduler.load_state_dict(ckpt["scheduler"])
 
     if rank == 0:
         print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}")

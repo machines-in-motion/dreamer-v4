@@ -146,7 +146,7 @@ def main(cfg: DictConfig):
     else:
         if rank == 0:
             print("Not resuming from checkpoint, starting from scratch.")
-
+    
     # TensorBoard + wandb (rank 0 only)
     if rank == 0:
         # Use stable log_dir if resuming, otherwise create new one
@@ -209,7 +209,8 @@ def main(cfg: DictConfig):
     
     if rank == 0:
         print("Starting warmup iterations...")
-
+    # optim = torch.optim.AdamW(denoiser.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+    # scheduler = get_cosine_schedule_with_warmup(optim, 300, total_steps)
     loss_scaler = RMSLossScaler()
 
     # Track statistics
@@ -294,15 +295,17 @@ def main(cfg: DictConfig):
             # Do NOT add to a persistent tensor variable like 'accum_flow' here
             flow_loss = flow_loss/cfg.train.accum_grad_steps
             bootstrap_loss = bootstrap_loss/cfg.train.accum_grad_steps
-            
+            loss_micro_raw = flow_loss + bootstrap_loss
             if long_seq_sample:
                 flow_loss_scaled = loss_scaler('long_seq_flow_loss', flow_loss)
                 bootstrap_loss_scaled = loss_scaler('long_seq_shortcut_loss', bootstrap_loss)
-                loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
+                loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)
+                # loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
             else: 
                 flow_loss_scaled = loss_scaler('short_seq_flow_loss', flow_loss)
                 bootstrap_loss_scaled = loss_scaler('short_seq_shortcut_loss', bootstrap_loss)
-                loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
+                loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)
+                # loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
 
             loss_micro.backward()
             
