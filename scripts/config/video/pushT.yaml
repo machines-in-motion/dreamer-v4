@@ -1,0 +1,53 @@
+# @package _global_
+defaults:
+ - /tokenizer: /pushT
+
+dual_stream: false
+dynamics_ckpt: null 
+reload_checkpoint: null
+output_dir: checkpoints/dynamics/pre-release/${now:%Y-%m-%d_%H-%M-%S}
+plot_every: 1000
+print_every: 100
+log_every: 25
+save_every: 2000
+seed: 42
+
+denoiser:
+  dual_stream: false
+  num_action_tokens: 1         # Number of tokens for the image or other modalities
+  num_latent_tokens: 256       # The number of latent tokens per frame
+  num_register_tokens: 8
+  context_length: 32           # The context length for the dynamics model
+  max_sequence_length: 64      # The maximum temporal horizon of the tokenizer during training
+  model_dim: 1024              # The dimension of the transformer latents
+  latent_dim: 32               # The dimention of the encoder output latents (z)
+  n_layers: 8                  # Causal tokenizer encoder depth
+  n_heads: 16
+  n_kv_heads: 16
+  dropout_prob: 0.0
+  qk_norm: false
+  num_noise_levels: 128
+  n_actions: 2
+
+train:
+  device: 'cuda:0'
+  use_compile: true
+  num_epochs: 100
+  batch_per_gpu: 8
+  long_seq_batch_per_gpu: 2
+  long_seq_prob: 0.2
+  context_length: 32
+  accum_grad_steps: 1
+  lr: 1e-4
+  num_workers: 12
+  lpips_weight: 0.2
+  num_training_steps: 1e7
+  mixed_precision: false
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+  video_pretraining: true # Set the action to zero in doing video pretraining
+
+wandb:
+  enable: true
+  project: "dreamer-v4-dynamics"
+  run_name: null

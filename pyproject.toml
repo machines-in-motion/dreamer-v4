@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dreamerv4"
+version = "0.4.3"
+description = "Machines in Motion (MiM) implementation of the Dreamver V4 world model."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+authors = [
+    { name = "Joseph Amigo", email = "ja5009@nyu.edu" },
+    { name = "Rooholla Khorrambakht", email = "rk4342@nyu.edu" },
+]
+
+dependencies = [
+    # "torch==2.2.0",
+    # "lpips==0.1.4",
+    # "tensorboard==2.20.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

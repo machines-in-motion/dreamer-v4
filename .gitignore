@@ -205,6 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+checkpoints
 logs
 outputs
 checkpoints
@@ -217,3 +218,5 @@ logs_single
 tokenizer_ckpt_cfg1_old_masker
 fsdp_logs
 HPC
+.vscode
+scripts/tmp

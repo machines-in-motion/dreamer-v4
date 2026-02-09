@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+ - /dataset: pushT
+
+reload_checkpoint: /home/mim-server/projects/rooholla/dreamer-v4-draft/checkpoints/tokenizer_ckpts/pushT.pt
+tokenizer_ckpt: checkpoints/tokenizer_ckpts/pushT/2026-01-21_00-43-43/24000.pt
+output_dir: checkpoints/tokenizer_ckpts/pushT/${now:%Y-%m-%d_%H-%M-%S}
+plot_every: 1000
+print_every: 100
+log_every: 25
+save_every: 1000
+seed: 42
+
+tokenizer:
+  dual_stream: false
+  num_modality_tokens: 256    # Number of tokens for the image or other modalities
+  num_latent_tokens: 256      # The number of latent tokens per frame
+  context_length: 32           # The maximum temporal horizon of the tokenizer
+  max_sequence_length: 32      # The maximum temporal horizon of the tokenizer during training
+  model_dim: 1024              # The dimension of the transformer latents
+  latent_dim: 32              # The dimention of the encoder output latents (z)
+  enc_num_layers: 4           # Causal tokenizer encoder depth
+  dec_num_layers: 4           # Causal tokenizer decoder depth
+  n_heads: 16
+  n_kv_heads: 16
+  dropout_prob: 0.0
+  qk_norm: false
+  patch_size: 16 # Note: image_size//patch_size should be equal to num_modality_tokens
+
+train:
+  use_compile: true
+  num_epochs: 60
+  batch_per_gpu: 2
+  grad_accum_steps: 2
+  lr: 1e-4
+  weight_decay: 0.01
+  num_workers: 12
+  lpips_weight: 0.2
+  mixed_precision: true
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+
+wandb:
+  api_key: null
+  project: "dreamer-v4-tokenizer"
+  run_name: null
