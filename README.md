@@ -5,12 +5,12 @@ Unofficial PyTorch implementation of the Dreamer-V4 world model component (**cau
 <p align="center">
   <img src="docs/assets/pushT-small-1.gif" width="32%" />
   <img src="docs/assets/soar-small-1.gif" width="32%" />
-  <img src="docs/assets/soar-big-1.gif" width="32%" />
+  <img src="docs/assets/finger2.gif" width="32%" />
 </p>
 <p align="center">
+  <img src="docs/assets/dreamerV4-pushT-autoregressive-48.gif" width="32%" />
   <img src="docs/assets/soar-big-1.gif" width="32%" />
-  <img src="docs/assets/soar-big-2.gif" width="32%" />
-  <img src="docs/assets/soar-big-3.gif" width="32%" />
+  <img src="docs/assets/finger1.gif" width="32%" />
 </p>
 
 ---
