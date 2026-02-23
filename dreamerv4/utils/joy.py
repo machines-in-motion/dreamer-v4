@@ -4,7 +4,19 @@ import threading
 from pygame.locals import *
 import numpy as np
 import time
+import zmq
+import msgpack
+import zerorpc
 
+
+class FingerSubscriber:
+    def __init__(self, server_addr):
+        self.c = zerorpc.Client()
+        self.c.connect(server_addr)
+
+    def getState(self):
+        return np.array(self.c.getState())
+        
 
 class JoyManager:
 
@@ -110,7 +122,7 @@ class XBoxController(JoyManager):
                 f"Could not communicate with the joystick with index: {joystick_index}"
             )
 
-    def getStates(self, deadzone=0.1):
+    def getState(self, deadzone=0.1):
         analog, digital = self.read_values()
         for i in [0, 1, 3, 4]:
             if np.abs(analog[i]) <= deadzone:

@@ -384,7 +384,9 @@ class ShardedHDF5Dataset(Dataset):
         split: str = "train",          # "train" or "test"
         train_fraction: float = 0.9,   # fraction of episodes in train
         split_seed: int = 42,          # seed for reproducible split
-        shuffle_windows: bool = True,    
+        shuffle_windows: bool = True, 
+        ep_count_offset: int = 0,      # offset to add to episode indices (for multi-dataset merging)   
+        absolute_actions=False,                 # whether to convert actions to absolute coordinates (deprecated
     ):
         self.shuffle_windows = shuffle_windows
         self.data_dir = Path(data_dir)
@@ -393,6 +395,7 @@ class ShardedHDF5Dataset(Dataset):
         self.split = split
         self.train_fraction = train_fraction
         self.split_seed = split_seed
+        self.absolute_actions = absolute_actions
 
         # Load metadata
         with open(self.data_dir / 'metadata.json', 'r') as f:
@@ -400,7 +403,7 @@ class ShardedHDF5Dataset(Dataset):
 
         self.num_shards = self.metadata['num_shards']
         self.shard_files = [
-            self.data_dir / f"shard_{i:04d}.h5"
+            self.data_dir / f"shard_{i+ep_count_offset:04d}.h5"
             for i in range(self.num_shards)
         ]
 
@@ -411,7 +414,11 @@ class ShardedHDF5Dataset(Dataset):
         for shard_idx, shard_file in enumerate(self.shard_files):
             with h5py.File(shard_file, 'r') as f:
                 num_episodes = f.attrs['num_episodes']
-                lengths = f['episode_lengths'][:]
+                try:
+                    lengths = f['episode_lengths'][:]
+                except:
+                    lengths = np.array([f['episode_lengths'][()]])
+
 
                 # Store episode lengths for statistics
                 self.episode_lengths.extend(lengths.tolist())
@@ -461,7 +468,10 @@ class ShardedHDF5Dataset(Dataset):
         # Open HDF5 file (each worker maintains its own handle)
         with h5py.File(shard_file, 'r') as f:
             images = f['images'][ep_idx, start:end]
-            actions = f['actions'][ep_idx, start:end]
+            if self.absolute_actions:
+                actions = f['actions_abs'][ep_idx, start:end]
+            else:
+                actions = f['actions_rel'][ep_idx, start:end]
 
         # Convert to PyTorch
         images = torch.from_numpy(images).float() / 255.0
