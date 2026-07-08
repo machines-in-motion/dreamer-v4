@@ -2,8 +2,11 @@
 defaults:
  - /dataset: pushT
 
-reload_checkpoint: /home/mim-server/projects/rooholla/dreamer-v4-draft/checkpoints/tokenizer_ckpts/pushT.pt
-tokenizer_ckpt: checkpoints/tokenizer_ckpts/pushT/2026-01-21_00-43-43/24000.pt
+reload_checkpoint: null
+# PushT-specific tokenizer (405M, same architecture as the SOAR tokenizer, trained
+# on pushT). Verified compatible with dynamics-pushT-110M and visibly sharper than
+# the SOAR tokenizer. Swap to tokenizer-soar-400M.pt for the README's default pairing.
+tokenizer_ckpt: checkpoints/tokenizer_ckpts/pushT.pt
 output_dir: checkpoints/tokenizer_ckpts/pushT/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100

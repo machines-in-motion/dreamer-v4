@@ -105,8 +105,24 @@ class AutoRegressiveForwardDynamics:
         self.context_cond_tau = context_cond_tau
         self.denoising_step_count = denoising_step_count
         self.max_forward_steps = max_forward_steps
-        self.current_frame_index = 0        
-    
+        self.current_frame_index = 0
+
+        num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+        # Discrete noise-level index used to condition context/committed frames
+        # (they are stored in the KV cache noised to `context_cond_tau`).
+        self.cond_tau_idx = get_noise_index(self.context_cond_tau, num_noise_levels)
+        # Shortcut-step index used for the LARGE denoising steps taken during a
+        # rollout step (d = 1 / denoising_step_count).
+        self.denoise_step_idx = get_step_index(1.0 / self.denoising_step_count, num_noise_levels)
+        # Shortcut-step index used when COMMITTING a frame to the KV cache.
+        # Every committed frame — both the context frames primed in reset() and
+        # each frame produced in step() — is a "conditioning" frame and must be
+        # keyed identically, so both paths use this single d_min index. (Before,
+        # reset() committed the context with `denoise_step_idx` while step()
+        # committed with d_min, leaving the primed context inconsistent with the
+        # rolled-out frames in the cache.)
+        self.commit_step_idx = get_step_index(1.0 / num_noise_levels, num_noise_levels)
+
     @torch.no_grad
     def reset(self, imgs_init, actions_init=None):
         
@@ -127,20 +143,20 @@ class AutoRegressiveForwardDynamics:
                                             update_cache = True)
         
         #Initialize the dynamics KV cache
-        self.denoiser.init_cache(batch_size, context_length=self.context_length, device=self.device, dtype=self.dtype)    
+        self.denoiser.init_cache(batch_size, context_length=self.context_length, device=self.device, dtype=self.dtype)
         latents_cond = (1.0 - self.context_cond_tau) * torch.randn_like(latents_cond).to(latents_cond.device) + self.context_cond_tau * latents_cond
-        self.cond_tau_idx = get_noise_index(self.context_cond_tau, self.denoiser.cfg.denoiser.num_noise_levels)
         tau_index_tensor = torch.full(
             (batch_size, latents_cond.shape[1]),
             self.cond_tau_idx,
             dtype=torch.long,
             device=self.device,
         )
-        step_size = 1./self.denoising_step_count
-        denoising_step_index = get_step_index(step_size, self.denoiser.cfg.denoiser.num_noise_levels)
+        # Commit the primed context frames with the same d_min shortcut-step
+        # index that step() uses for every rolled-out frame (see __init__), so
+        # the whole KV cache represents conditioning frames consistently.
         step_index_tensor = torch.full(
             (batch_size, latents_cond.shape[1]),
-            denoising_step_index,
+            self.commit_step_idx,
             dtype=torch.long,
             device=self.device,
         )
@@ -161,29 +177,29 @@ class AutoRegressiveForwardDynamics:
         B, _, N, D = self.current_z.shape
         z_t = torch.randn(B, 1, N, D, device=self.device, dtype=self.dtype)
         step_length = 1 / self.denoising_step_count
-        step_length_idx = get_step_index(step_length, self.denoiser.cfg.denoiser.num_noise_levels)
-        
+
         for i in range(self.denoising_step_count):
             tau_curr = i / self.denoising_step_count
             curr_tau_idx = get_noise_index(tau_curr, self.denoiser.cfg.denoiser.num_noise_levels)
             tau_idxs = torch.full((B, 1), curr_tau_idx, dtype=torch.long, device=self.device)
-            step_idxs = torch.full((B, 1), step_length_idx, dtype=torch.long, device=self.device)
-            
+            step_idxs = torch.full((B, 1), self.denoise_step_idx, dtype=torch.long, device=self.device)
+
             pred = self.denoiser.forward_step(
                 action=actions_t, noisy_z=z_t, sigma_idx=tau_idxs,
                 step_idx=step_idxs, start_step_idx=self.current_frame_index, update_cache=False
             )
             z_t = z_t + (pred - z_t) / max(1.0 - tau_curr, 1e-5) * step_length
 
-
+        # Commit the freshly predicted frame to the cache: noise it back to
+        # tau_cond and key it with the same (cond_tau_idx, commit_step_idx) used
+        # for every other committed frame (reset + prior steps). Using the
+        # Python-float scalar keeps cor_z_t in z_t's dtype.
         tau_idxs = torch.full((B, 1), self.cond_tau_idx, dtype=torch.long, device=self.device)
-        d_min_idx = get_step_index(1./self.denoiser.cfg.denoiser.num_noise_levels, self.denoiser.cfg.denoiser.num_noise_levels)
-        step_idxs = torch.full((B, 1), d_min_idx, dtype=torch.long, device=self.device)
-        
-        seq_cor_tau = torch.full((B, 1, 1, 1), self.context_cond_tau, dtype=torch.bfloat16, device=self.device)
+        step_idxs = torch.full((B, 1), self.commit_step_idx, dtype=torch.long, device=self.device)
+
         eps = torch.randn_like(z_t)
-        cor_z_t = (1. - seq_cor_tau) * eps + seq_cor_tau * z_t
-            
+        cor_z_t = (1.0 - self.context_cond_tau) * eps + self.context_cond_tau * z_t
+
         self.denoiser.forward_step(
             action=actions_t, noisy_z=cor_z_t, sigma_idx=tau_idxs,
             step_idx=step_idxs, start_step_idx=self.current_frame_index, update_cache=True
