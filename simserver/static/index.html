@@ -82,8 +82,9 @@
 
   function readAction(){
     let ax = 0, ay = 0;
-    if (keys['arrowup']   || keys['w']) ay += 1;
-    if (keys['arrowdown'] || keys['s']) ay -= 1;
+    // up/down flipped so pressing up moves the pusher up on screen
+    if (keys['arrowup']   || keys['w']) ay -= 1;
+    if (keys['arrowdown'] || keys['s']) ay += 1;
     if (keys['arrowright']|| keys['d']) ax += 1;
     if (keys['arrowleft'] || keys['a']) ax -= 1;
     const gps = navigator.getGamepads ? navigator.getGamepads() : [];
@@ -91,10 +92,10 @@
       if (!gp) continue;
       const rx = gp.axes[2] || 0, ry = gp.axes[3] || 0;
       if (Math.abs(rx) > 0.12) ax = rx;
-      if (Math.abs(ry) > 0.12) ay = -ry;   // stick up = +
+      if (Math.abs(ry) > 0.12) ay = ry;    // stick up = up on screen (matches keys)
       break;
     }
-    // action = [up(+)/down(-), right(+)/left(-)], clamped to [-1,1]
+    // action = [up/down, left/right], clamped to [-1, 1]
     return [Math.max(-1, Math.min(1, ay)), Math.max(-1, Math.min(1, ax))];
   }
 
@@ -107,22 +108,29 @@
     const now = performance.now(), dt = now - lastFrameT; lastFrameT = now;
     if (dt > 0) { const hz = 1000/dt; fpsEMA = fpsEMA ? 0.85*fpsEMA + 0.15*hz : hz; fpsEl.textContent = fpsEMA.toFixed(1); }
   }
+  // Pace the interactive loop to the training rate (dt = 0.2 s → 5 Hz): the
+  // model does one 0.2 s step per send, so 5 sends/s ≈ real-time motion.
+  const TARGET_FPS = 5, TARGET_DT_MS = 1000 / TARGET_FPS;
+  let lastSend = 0;
   function sendNext(){
     if (!ws || ws.readyState !== 1) return;
+    lastSend = performance.now();
     ws.send(JSON.stringify({ action: readAction() }));
   }
   function connect(){
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/ws`);
     ws.binaryType = 'blob';
-    ws.onopen  = () => { badge.textContent = 'live'; badge.className = 'badge live'; sendNext(); };
+    ws.onopen  = () => { badge.textContent = 'live'; badge.className = 'badge live'; };
     ws.onclose = () => { badge.textContent = 'disconnected'; badge.className = 'badge off'; setTimeout(connect, 1000); };
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') { pendingMeta = JSON.parse(ev.data); return; }
       drawBlob(ev.data);
       if (pendingMeta) { tEl.textContent = pendingMeta.t; if (pendingMeta.step_ms) msEl.textContent = pendingMeta.step_ms; pendingMeta = null; }
-      // request/response paced: ask for the next frame now.
-      sendNext();
+      // hold ~5 Hz between sends (the server's initial frame, with lastSend=0,
+      // kicks the loop immediately; steady state paces to the training dt).
+      const wait = Math.max(0, TARGET_DT_MS - (performance.now() - lastSend));
+      setTimeout(sendNext, wait);
     };
   }
   connect();

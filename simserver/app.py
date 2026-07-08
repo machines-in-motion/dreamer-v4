@@ -45,7 +45,7 @@ def create_app(engine: SimEngine) -> FastAPI:
     @app.post("/reset")
     async def reset(req: ResetReq):
         sid = await run_in_threadpool(engine.reset, req.seed, req.start_idx)
-        obs = engine.encode_obs(req.obs_type, req.encoding)
+        obs = await run_in_threadpool(engine.encode_obs, req.obs_type, req.encoding)
         return {"session_id": sid, "obs": obs, "t": 0,
                 "info": {"max_steps": engine.max_steps}}
 
@@ -55,7 +55,7 @@ def create_app(engine: SimEngine) -> FastAPI:
             res = await run_in_threadpool(engine.step, req.session_id, req.action)
         except SessionError as e:
             raise HTTPException(status_code=409, detail=str(e))
-        obs = engine.encode_obs(req.obs_type, req.encoding)
+        obs = await run_in_threadpool(engine.encode_obs, req.obs_type, req.encoding)
         return {"obs": obs, "reward": res["reward"], "terminated": res["terminated"],
                 "truncated": res["truncated"], "t": res["t"],
                 "info": {"step_ms": round(res["step_ms"], 1)}}
@@ -90,8 +90,14 @@ def create_app(engine: SimEngine) -> FastAPI:
                 try:
                     res = await run_in_threadpool(engine.step, sid, action)
                 except SessionError:
+                    # stale session or episode horizon reached → start fresh
                     sid = await run_in_threadpool(engine.reset, None, 0)
                     res = {"t": 0, "step_ms": 0.0}
+                else:
+                    if res.get("truncated"):
+                        # loop the browser seamlessly: reset at the horizon
+                        sid = await run_in_threadpool(engine.reset, None, 0)
+                        res = {"t": 0, "step_ms": res.get("step_ms", 0.0)}
                 await sock.send_json({"t": res["t"], "step_ms": round(res.get("step_ms", 0.0), 1)})
                 await sock.send_bytes(await run_in_threadpool(engine.last_jpeg_bytes))
         except WebSocketDisconnect:

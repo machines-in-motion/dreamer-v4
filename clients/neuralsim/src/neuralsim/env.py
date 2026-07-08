@@ -116,10 +116,13 @@ class NeuralSimEnv:
                 "obs_type": self.obs_type, "encoding": self.encoding}
         r = self._http.post(self.base_url + "/step", json=body, timeout=self.timeout)
         if r.status_code == 409:
-            raise RuntimeError(
-                "The server has no active session for this client — another client may have "
-                "reset it (the simulator is single-env). Call reset() again."
-            )
+            # Either the episode reached its horizon, or another client (single-env)
+            # took over the session. The server says which in `detail`.
+            try:
+                detail = r.json().get("detail", "")
+            except Exception:
+                detail = ""
+            raise RuntimeError((detail or "no active session (single-env server)") + " — call reset().")
         r.raise_for_status()
         data = r.json()
         self._last_obs = _decode_obs(data["obs"])
