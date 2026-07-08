@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuralsim"
+version = "0.1.0"
+description = "Lightweight Gym-style client for the DreamerV4 pushT neural simulator."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "requests>=2.20",
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+gym = ["gymnasium>=0.28"]     # optional: real gymnasium spaces
+jpeg = ["pillow>=8"]          # optional: decode jpeg-encoded observations
+
+[tool.setuptools.packages.find]
+where = ["src"]

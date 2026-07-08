@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pushT · neural simulator</title>
+<style>
+  :root{
+    --bg:#15130E; --panel:#1E1B14; --line:#332E23; --ink:#ECE6DA;
+    --soft:#ADA692; --faint:#7C7565; --accent:#E9604D; --good:#68B37F;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
+  .app{width:100%;max-width:560px}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--accent);margin:0 0 8px;display:flex;gap:9px;align-items:center}
+  .eyebrow::before{content:"";width:22px;height:2px;background:var(--accent)}
+  h1{font-size:22px;font-weight:800;letter-spacing:-.01em;margin:0 0 16px}
+  h1 span{color:var(--soft);font-weight:500}
+  .screen{position:relative;background:#000;border:1px solid var(--line);border-radius:12px;
+    overflow:hidden;box-shadow:0 24px 60px -34px #000}
+  canvas{width:100%;height:auto;display:block;image-rendering:auto}
+  .badge{position:absolute;top:10px;left:10px;font-family:var(--mono);font-size:11px;
+    letter-spacing:.04em;background:rgba(0,0,0,.55);color:var(--ink);padding:4px 8px;border-radius:6px}
+  .badge.live::before{content:"●";color:var(--good);margin-right:6px}
+  .badge.off::before{content:"●";color:var(--faint);margin-right:6px}
+  .bar{display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap}
+  button{font-family:var(--sans);font-size:14px;font-weight:600;color:var(--ink);
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 15px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .stat{font-family:var(--mono);font-size:12px;color:var(--soft);font-variant-numeric:tabular-nums;margin-left:auto}
+  .stat b{color:var(--ink)}
+  .help{margin-top:16px;font-size:13px;color:var(--soft);line-height:1.7}
+  .help kbd{font-family:var(--mono);font-size:11.5px;background:var(--panel);border:1px solid var(--line);
+    border-bottom-width:2px;border-radius:5px;padding:1px 6px;color:var(--ink)}
+  .help .accent{color:var(--accent)}
+  .pad{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--faint);
+    vertical-align:middle;margin-right:5px}
+  .pad.on{background:var(--good)}
+</style>
+</head>
+<body>
+<div class="app">
+  <p class="eyebrow">DreamerV4 · pushT</p>
+  <h1>Neural simulator <span>— drive the world model</span></h1>
+
+  <div class="screen">
+    <canvas id="cv" width="256" height="256"></canvas>
+    <div id="badge" class="badge off">connecting…</div>
+  </div>
+
+  <div class="bar">
+    <button id="reset">Reset</button>
+    <span class="stat"><span class="pad" id="padled"></span><span id="padname">no gamepad</span>
+      &nbsp;·&nbsp; t=<b id="t">0</b> &nbsp;·&nbsp; <b id="fps">0.0</b> Hz &nbsp;·&nbsp; <b id="ms">–</b> ms</span>
+  </div>
+
+  <p class="help">
+    <b>Keyboard:</b> <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>
+    move the pusher &nbsp;·&nbsp; <b>Gamepad:</b> right stick.
+    Everything on screen is <span class="accent">imagined</span> by the model at ~5&nbsp;Hz — hold a direction and watch it push the T-block.
+  </p>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  const badge = document.getElementById('badge');
+  const tEl = document.getElementById('t'), fpsEl = document.getElementById('fps'), msEl = document.getElementById('ms');
+  const padled = document.getElementById('padled'), padname = document.getElementById('padname');
+  const keys = {};
+  addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; });
+  addEventListener('keyup',   e => { keys[e.key.toLowerCase()] = false; });
+  document.getElementById('reset').onclick = () => ws && ws.readyState === 1 && ws.send(JSON.stringify({type:'reset'}));
+
+  addEventListener('gamepadconnected', e => { padname.textContent = e.gamepad.id.slice(0,22); padled.classList.add('on'); });
+  addEventListener('gamepaddisconnected', () => { padname.textContent = 'no gamepad'; padled.classList.remove('on'); });
+
+  function readAction(){
+    let ax = 0, ay = 0;
+    if (keys['arrowup']   || keys['w']) ay += 1;
+    if (keys['arrowdown'] || keys['s']) ay -= 1;
+    if (keys['arrowright']|| keys['d']) ax += 1;
+    if (keys['arrowleft'] || keys['a']) ax -= 1;
+    const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (const gp of gps) {
+      if (!gp) continue;
+      const rx = gp.axes[2] || 0, ry = gp.axes[3] || 0;
+      if (Math.abs(rx) > 0.12) ax = rx;
+      if (Math.abs(ry) > 0.12) ay = -ry;   // stick up = +
+      break;
+    }
+    // action = [up(+)/down(-), right(+)/left(-)], clamped to [-1,1]
+    return [Math.max(-1, Math.min(1, ay)), Math.max(-1, Math.min(1, ax))];
+  }
+
+  let ws, lastFrameT = performance.now(), fpsEMA = 0, pendingMeta = null;
+  function drawBlob(blob){
+    const url = URL.createObjectURL(blob);
+    const im = new Image();
+    im.onload = () => { ctx.drawImage(im, 0, 0, cv.width, cv.height); URL.revokeObjectURL(url); };
+    im.src = url;
+    const now = performance.now(), dt = now - lastFrameT; lastFrameT = now;
+    if (dt > 0) { const hz = 1000/dt; fpsEMA = fpsEMA ? 0.85*fpsEMA + 0.15*hz : hz; fpsEl.textContent = fpsEMA.toFixed(1); }
+  }
+  function sendNext(){
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ action: readAction() }));
+  }
+  function connect(){
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = 'blob';
+    ws.onopen  = () => { badge.textContent = 'live'; badge.className = 'badge live'; sendNext(); };
+    ws.onclose = () => { badge.textContent = 'disconnected'; badge.className = 'badge off'; setTimeout(connect, 1000); };
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') { pendingMeta = JSON.parse(ev.data); return; }
+      drawBlob(ev.data);
+      if (pendingMeta) { tEl.textContent = pendingMeta.t; if (pendingMeta.step_ms) msEl.textContent = pendingMeta.step_ms; pendingMeta = null; }
+      // request/response paced: ask for the next frame now.
+      sendNext();
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

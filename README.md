@@ -132,6 +132,31 @@ torchrun --standalone --nproc_per_node=1 scripts/train_dynamics.py \
 
 **Requirement**: The small dynamic model (110M parameters) was trained on 4xH200 GPUs for 72 hours (SOAR dataset) while PushT model was trained on a single RTX6000 Pro (97GB) for same ammount of time. The tokenizer was trained on 24 H200 GPUs for 48 hours. With change of batch size and context length all our small models can be trained on a single RTX6000 Pro. 
 
+## Serve it as a neural simulator
+
+Run the world model as a **single-environment neural simulator** with a
+Gym-style REST API (for policies) and a browser page (for live human control):
+
+```bash
+pip install fastapi "uvicorn[standard]" pillow   # one-time
+python scripts/serve.py                           # → http://0.0.0.0:8000
+```
+
+- **Browser control**: open `http://<host>:8000/` — drive it with the keyboard or a gamepad.
+- **Policies** (a friend, another machine): hand them the lightweight client in
+  [`clients/neuralsim`](clients/neuralsim) (`pip install`, deps = `requests`+`numpy`):
+
+  ```python
+  import neuralsim
+  env = neuralsim.make("http://<host>:8000")            # Gymnasium-style
+  obs, info = env.reset(seed=0)                          # (256, 256, 3) uint8
+  obs, reward, terminated, truncated, info = env.step([ax, ay])   # action in [-1,1]^2
+  ```
+
+See [`simserver/README.md`](simserver/README.md) for the API, config knobs, and how
+to share it (Tailscale / cloudflared). Note: this checkpoint's dynamics has no
+reward head, so `reward` is always `0.0` — it's a world-model sandbox, not a scored task.
+
 ## Repository Structure
 
 ### Main Components

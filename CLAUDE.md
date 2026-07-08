@@ -36,6 +36,15 @@ python -m dreamerv4.datasets --data_dir /path/to/sharded --window_size 96
 
 There is **no test suite, linter, or CI config** in this repo. Overrides use Hydra's `key=value` CLI syntax (dotted paths, e.g. `train.lr=1e-4`, `denoiser.context_length=32`).
 
+```bash
+# Serve the world model as a single-env neural simulator (REST + browser)
+python scripts/serve.py                    # FastAPI on 0.0.0.0:8000; needs fastapi, uvicorn, pillow
+```
+
+### Neural simulator (`simserver/`, `clients/neuralsim/`)
+- `simserver/` — FastAPI service around `SimEngine`, which holds **one** loaded pushT world model and **one** live `AutoRegressiveForwardDynamics` session (the KV caches live on the shared model, so single-env by construction; all GPU calls serialized under a lock). REST `/reset` `/step` `/close` `/info` for the Gym client; WebSocket `/ws` + `simserver/static/index.html` for browser control. `reward` is always `0.0` (no reward head). Launch via `scripts/serve.py` (Hydra config `dynamics/pushT`, checkpoint paths resolved to absolute).
+- `clients/neuralsim/` — pip-installable Gymnasium-style client (`NeuralSimEnv`); hard deps **only `requests`+`numpy`** (obs default `raw_u8` → decoded with numpy; `jpeg`/`gym` are optional extras). Build a wheel with `python -m pip wheel --no-deps -w dist .`.
+
 ## Architecture
 
 ### Two-stage pipeline
