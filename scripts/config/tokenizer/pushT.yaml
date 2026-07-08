@@ -3,9 +3,11 @@ defaults:
  - /dataset: pushT
 
 reload_checkpoint: null
-# PushT-specific tokenizer (405M, same architecture as the SOAR tokenizer, trained
-# on pushT). Verified compatible with dynamics-pushT-110M and visibly sharper than
-# the SOAR tokenizer. Swap to tokenizer-soar-400M.pt for the README's default pairing.
+# PushT-specific tokenizer (same architecture as the SOAR tokenizer, trained on
+# pushT). Verified compatible with dynamics-pushT-110M and visibly sharper than the
+# SOAR tokenizer. Published on HF as `tokenizer-pushT-400M.pt`
+# (https://huggingface.co/Rooholla/dreamer-v4); place it here or override
+# tokenizer_ckpt=. Swap to tokenizer-soar-400M.pt for the README's SOAR pairing.
 tokenizer_ckpt: checkpoints/tokenizer_ckpts/pushT.pt
 output_dir: checkpoints/tokenizer_ckpts/pushT/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000

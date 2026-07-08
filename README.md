@@ -30,6 +30,7 @@ First download our [checkpoints](https://huggingface.co/Rooholla/dreamer-v4) and
 | Checkpoint | Parameters | Dataset | Config | Resolution | Download |
 |:-----------|:----------:|:-----------------:|:----------------:|:----------------:|:---------------:|
 | Tokenizer           | 400M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/) | [config](scripts/config/tokenizer/soar.yaml) |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/tokenizer-soar-400M.pt?download=true) |
+| Tokenizer           | 400M | [MiM PushT](https://huggingface.co/datasets/Rooholla/MiM-PushT) | [config](scripts/config/tokenizer/pushT.yaml) |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/tokenizer-pushT-400M.pt?download=true) |
 | Dynamics      | 110M | [MiM PushT](https://huggingface.co/datasets/Rooholla/MiM-PushT) | [config](scripts/config/dynamics/pushT.yaml)  |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamics-pushT-110M.pt?download=true) |
 | Dynamics | 110M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-small.yaml) | 256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamicsl-soar-110M.pt?download=true) |
 | Dynamics | 1.5B | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-large.yaml)  | 128×128 | Soon! |
@@ -47,12 +48,13 @@ python scripts/play-soar.py \
 ```
 ### PushT World Model 
 ```
-# PushT
+# PushT — uses the pushT-trained tokenizer (sharper reconstructions than SOAR here)
 python scripts/play-pushT.py \
-  tokenizer_ckpt=path/to/soar/tokenizer.pt \ # We use the SOAR tokenizer for PushT world model
-  dynamics_ckpt=path/to/dynamics.pt \
+  tokenizer_ckpt=path/to/tokenizer-pushT-400M.pt \
+  dynamics_ckpt=path/to/dynamics-pushT-110M.pt \
   dataset.data_dir=/path/to/pusht_data_sharded
 ```
+(The SOAR tokenizer also works with the pushT dynamics, but the pushT-trained tokenizer is noticeably sharper — see the checkpoint table above.)
 Running above will pops up an openCV windown showing the world-model predicted frames as you command it with your joystick. 
 
 **Requirement**: The small world models (110M parameters) run in real-time on a single 4090 GPU and require only 8GB of VRAM. The information for the large model will be provided upon its release in the future. 
