@@ -40,6 +40,7 @@ def main(cfg: DictConfig):
     engine = SimEngine(
         cfg, device,
         seed_episode=SEED_EPISODE,
+        seed_pool_size=int(os.environ.get("SEED_POOL_SIZE", 128)),
         num_init_frames=int(os.environ.get("SEED_LEN", 8)),
         context_len=int(os.environ.get("CONTEXT_LEN", 32)),
         denoising_steps=int(os.environ.get("DENOISING_STEPS", 4)),

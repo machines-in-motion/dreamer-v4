@@ -16,12 +16,12 @@ import threading
 import time
 import uuid
 
+import h5py
 import numpy as np
 import torch
 from PIL import Image
 from torch.nn.functional import interpolate
 
-from dreamerv4.datasets import PushTDataset
 from dreamerv4.models.utils import load_denoiser, load_tokenizer
 from dreamerv4.sampling import AutoRegressiveForwardDynamics
 
@@ -46,8 +46,7 @@ class SimEngine:
         device,
         *,
         seed_episode,
-        seed_window: int = 64,
-        seed_clip_idx: int = 10,
+        seed_pool_size: int = 128,
         num_init_frames: int = 8,
         context_len: int = 32,
         denoising_steps: int = 4,
@@ -73,16 +72,26 @@ class SimEngine:
         self.denoiser = load_denoiser(cfg, self.device, max_num_forward_steps=self._rope_len).eval()
         self.tokenizer = load_tokenizer(cfg, self.device, max_num_forward_steps=self._rope_len).eval()
 
-        # Cache a small pool of real seed frames on-GPU (avoids holding the whole
-        # multi-GB episode in RAM).
-        ds = PushTDataset(hd5_file_path=seed_episode, traj_len=seed_window,
-                          load_to_ram=False, non_overlapping=True)
-        batch = ds[min(seed_clip_idx, len(ds) - 1)]
-        imgs = interpolate(batch["observation.image"], self.resolution)   # (T,C,H,W) in [0,1]
-        acts = batch["action"][:, : self.n_act]                           # (T, n_act)
-        self.seed_imgs = imgs.to(self.device)
-        self.seed_acts = acts.to(self.device)
-        self.seed_window = int(self.seed_imgs.shape[0])
+        # Build a pool of seed windows sampled from ACROSS the whole episode, so
+        # each reset can start from a different real configuration. The pool is
+        # sampled with a fixed RNG so the set of possible starts is stable (and a
+        # given `seed` always maps to the same start); the per-reset choice is
+        # random. Cached on-GPU (~1-2 GB for the default pool).
+        n0 = self.num_init_frames
+        pool_rng = np.random.default_rng(0)
+        with h5py.File(seed_episode, "r") as f:
+            cam, act = f["cam1"], f["actions"]        # cam1: (T,3,H,W) float in [0,1]
+            total = int(cam.shape[0])
+            k = int(min(seed_pool_size, max(1, total - n0)))
+            starts = np.sort(pool_rng.choice(total - n0, size=k, replace=False))
+            imgs = np.stack([cam[s:s + n0] for s in starts])          # (K, n0, 3, H0, W0)
+            acts = np.stack([act[s:s + n0, : self.n_act] for s in starts])  # (K, n0, n_act)
+        imgs = torch.from_numpy(imgs).float()
+        K, W = imgs.shape[0], imgs.shape[1]
+        imgs = interpolate(imgs.view(K * W, *imgs.shape[2:]), self.resolution)
+        self.seed_pool_imgs = imgs.view(K, W, 3, *self.resolution).to(self.device)   # (K,n0,3,H,W)
+        self.seed_pool_acts = torch.from_numpy(acts).float().to(self.device)         # (K,n0,n_act)
+        self.pool_size = int(K)
 
         # session state (only ever touched by the worker thread)
         self.session_id = None
@@ -144,6 +153,7 @@ class SimEngine:
             "latent_dtype": "float16",
             "dt": float(self.cfg.dataset.get("dt", 0.2)),
             "max_steps": self.max_steps,
+            "seed_pool_size": self.pool_size,
             "num_denoising_steps": self.denoising_steps,
             "context_length": self.context_len,
             "reward": "none — the pushT dynamics has no reward head; reward is always 0.0",
@@ -168,13 +178,20 @@ class SimEngine:
 
     # ------------------------------------------- implementations (worker only)
     def _reset_impl(self, seed, start_idx) -> str:
+        # Choose which real seed window to start from:
+        #   seed given      -> reproducible config + noise (seed picks the window)
+        #   start_idx given -> that specific window (override)
+        #   neither         -> a random config each reset
         if seed is not None:
             torch.manual_seed(int(seed))
-        n0 = self.num_init_frames
-        span = max(1, self.seed_window - n0 + 1)
-        s = int(start_idx) % span
-        imgs = self.seed_imgs[s:s + n0].unsqueeze(0)                    # (1,n0,C,H,W)
-        acts = self.seed_acts[s:s + n0].unsqueeze(0).to(self.dtype)     # (1,n0,n_act)
+            idx = int(seed) % self.pool_size
+        elif start_idx is not None:
+            idx = int(start_idx) % self.pool_size
+        else:
+            idx = int(torch.randint(self.pool_size, (1,)).item())
+        imgs = self.seed_pool_imgs[idx].unsqueeze(0)                    # (1,n0,C,H,W)
+        acts = self.seed_pool_acts[idx].unsqueeze(0).to(self.dtype)    # (1,n0,n_act)
+        self._start_idx = idx
 
         world = AutoRegressiveForwardDynamics(
             self.denoiser, self.tokenizer,

@@ -13,8 +13,8 @@ _STATIC = Path(__file__).parent / "static"
 
 
 class ResetReq(BaseModel):
-    seed: Optional[int] = None
-    start_idx: int = 0
+    seed: Optional[int] = None       # reproducible config+rollout; None = random start
+    start_idx: Optional[int] = None  # force a specific pool window (overrides randomness)
     obs_type: str = "image"      # "image" | "latent"
     encoding: str = "raw_u8"     # "raw_u8" | "jpeg"  (image); latents are "raw_f16"
 
@@ -76,13 +76,13 @@ def create_app(engine: SimEngine) -> FastAPI:
         # A browser connection owns the single env: it resets on connect and on
         # request, and drives one step per message (request/response paced).
         await sock.accept()
-        sid = await run_in_threadpool(engine.reset, None, 0)
+        sid = await run_in_threadpool(engine.reset, None, None)   # random start
         await sock.send_bytes(await run_in_threadpool(engine.last_jpeg_bytes))
         try:
             while True:
                 msg = await sock.receive_json()
                 if msg.get("type") == "reset":
-                    sid = await run_in_threadpool(engine.reset, msg.get("seed"), int(msg.get("start_idx", 0)))
+                    sid = await run_in_threadpool(engine.reset, msg.get("seed"), msg.get("start_idx"))
                     await sock.send_json({"t": 0})
                     await sock.send_bytes(await run_in_threadpool(engine.last_jpeg_bytes))
                     continue
@@ -90,13 +90,13 @@ def create_app(engine: SimEngine) -> FastAPI:
                 try:
                     res = await run_in_threadpool(engine.step, sid, action)
                 except SessionError:
-                    # stale session or episode horizon reached → start fresh
-                    sid = await run_in_threadpool(engine.reset, None, 0)
+                    # stale session or episode horizon reached → start a new random episode
+                    sid = await run_in_threadpool(engine.reset, None, None)
                     res = {"t": 0, "step_ms": 0.0}
                 else:
                     if res.get("truncated"):
-                        # loop the browser seamlessly: reset at the horizon
-                        sid = await run_in_threadpool(engine.reset, None, 0)
+                        # loop the browser seamlessly: new random episode at the horizon
+                        sid = await run_in_threadpool(engine.reset, None, None)
                         res = {"t": 0, "step_ms": res.get("step_ms", 0.0)}
                 await sock.send_json({"t": res["t"], "step_ms": round(res.get("step_ms", 0.0), 1)})
                 await sock.send_bytes(await run_in_threadpool(engine.last_jpeg_bytes))
